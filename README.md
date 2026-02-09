@@ -18,13 +18,11 @@ A multi-tool SOC stack that mirrors enterprise security operations:
 - **Infrastructure Automation** — 20+ Ansible playbooks for agent deployment, CIS hardening, and AD lab orchestration
 - **Network Security** — VLAN segmentation, UDM Pro IDS/IPS, Tailscale overlay network
 
-## Repositories
+## Repository
 
 | Repository | Description |
 |-----------|-------------|
-| [wazuh-detection-engineering](https://github.com/hifisol/wazuh-detection-engineering) | Custom Wazuh rules, Zeek decoders, RITA integration, and Discord alerting |
-| [ansible-security-automation](https://github.com/hifisol/ansible-security-automation) | Playbooks for security agent deployment, server hardening, CIS benchmarks, AD lab |
-| [homelab-soc-infrastructure](https://github.com/hifisol/homelab-soc-infrastructure) | SOC architecture, Docker compositions, utility scripts, deployment docs |
+| [homelab-soc-infrastructure](https://github.com/hifisol/homelab-soc-infrastructure) | Full SOC stack — detection rules, Ansible automation, Docker services, persistence scripts, and architecture docs |
 
 ## Tools & Skills
 
