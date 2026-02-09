@@ -54,4 +54,4 @@ CIS Benchmarks, Server Hardening, Security Baseline Automation
 
 ## Contact
 
-- [LinkedIn](https://www.linkedin.com/in/YOUR-LINKEDIN) *(update with your actual URL)*
+- [LinkedIn](https://www.linkedin.com/in/halbert-farias) *(update with your actual URL)*
