@@ -1,0 +1,176 @@
+---
+# =============================================================================
+# Check Security Agent Status on All Hosts
+# =============================================================================
+# Audits Wazuh, Velociraptor, Zabbix, Tactical RMM, and Tailscale agent
+# status across all inventory hosts.
+#
+# Usage:
+#   ansible-playbook playbooks/check-agents.yml                    # All hosts
+#   ansible-playbook playbooks/check-agents.yml --limit web-server-1 # Single host
+# =============================================================================
+
+- name: Check Security Agent Status on All Hosts
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  tasks:
+    # --- Velociraptor ---
+    - name: Check if Velociraptor agent is installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/velociraptor
+      register: velociraptor_binary
+
+    - name: Check if Velociraptor service exists
+      ansible.builtin.systemd:
+        name: velociraptor
+      register: velociraptor_service
+      failed_when: false
+
+    # --- Wazuh ---
+    - name: Check if Wazuh agent is installed
+      ansible.builtin.stat:
+        path: /var/ossec/bin/wazuh-control
+      register: wazuh_binary
+
+    - name: Check if Wazuh service exists
+      ansible.builtin.systemd:
+        name: wazuh-agent
+      register: wazuh_service
+      failed_when: false
+
+    # --- Zabbix ---
+    - name: Check if Zabbix agent is installed
+      ansible.builtin.stat:
+        path: /usr/sbin/zabbix_agentd
+      register: zabbix_binary
+
+    - name: Check if Zabbix agent2 is installed
+      ansible.builtin.stat:
+        path: /usr/sbin/zabbix_agent2
+      register: zabbix2_binary
+
+    - name: Check if Zabbix service exists
+      ansible.builtin.systemd:
+        name: zabbix-agent
+      register: zabbix_service
+      failed_when: false
+
+    - name: Check if Zabbix agent2 service exists
+      ansible.builtin.systemd:
+        name: zabbix-agent2
+      register: zabbix2_service
+      failed_when: false
+
+    # --- Tactical RMM ---
+    - name: Check if TRMM agent is installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/tacticalagent
+      register: trmm_binary
+
+    - name: Check if TRMM agent service exists
+      ansible.builtin.systemd:
+        name: tacticalagent
+      register: trmm_service
+      failed_when: false
+
+    - name: Check if MeshAgent is installed
+      ansible.builtin.stat:
+        path: /opt/tacticalmesh/meshagent
+      register: mesh_binary
+
+    - name: Check if MeshAgent service exists
+      ansible.builtin.systemd:
+        name: meshagent
+      register: mesh_service
+      failed_when: false
+
+    # --- Tailscale ---
+    - name: Check if Tailscale is installed
+      ansible.builtin.stat:
+        path: /usr/bin/tailscale
+      register: tailscale_binary
+
+    - name: Check if Tailscale service exists
+      ansible.builtin.systemd:
+        name: tailscaled
+      register: tailscale_service
+      failed_when: false
+
+    - name: Get Tailscale IP (if connected)
+      ansible.builtin.command: tailscale ip -4
+      register: tailscale_ip
+      changed_when: false
+      failed_when: false
+      when: tailscale_binary.stat.exists
+
+    # --- Summary ---
+    - name: Gather agent status summary
+      ansible.builtin.set_fact:
+        agent_status:
+          velociraptor:
+            installed: "{{ velociraptor_binary.stat.exists }}"
+            service_state: "{{ velociraptor_service.status.ActiveState | default('not-installed') }}"
+          wazuh:
+            installed: "{{ wazuh_binary.stat.exists }}"
+            service_state: "{{ wazuh_service.status.ActiveState | default('not-installed') }}"
+          zabbix:
+            installed: "{{ zabbix_binary.stat.exists or zabbix2_binary.stat.exists }}"
+            service_state: "{{ zabbix2_service.status.ActiveState | default(zabbix_service.status.ActiveState) | default('not-installed') }}"
+          trmm:
+            installed: "{{ trmm_binary.stat.exists }}"
+            service_state: "{{ trmm_service.status.ActiveState | default('not-installed') }}"
+          meshagent:
+            installed: "{{ mesh_binary.stat.exists }}"
+            service_state: "{{ mesh_service.status.ActiveState | default('not-installed') }}"
+          tailscale:
+            installed: "{{ tailscale_binary.stat.exists }}"
+            service_state: "{{ tailscale_service.status.ActiveState | default('not-installed') }}"
+            ip: "{{ tailscale_ip.stdout | default('N/A') }}"
+
+    - name: Display agent status for this host
+      ansible.builtin.debug:
+        msg:
+          - "============================================"
+          - "Host: {{ inventory_hostname }} ({{ ansible_host | default('N/A') }})"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Arch: {{ ansible_architecture }}"
+          - "--------------------------------------------"
+          - "Velociraptor Agent:"
+          - "  Installed: {{ agent_status.velociraptor.installed }}"
+          - "  Service: {{ agent_status.velociraptor.service_state }}"
+          - "Wazuh Agent:"
+          - "  Installed: {{ agent_status.wazuh.installed }}"
+          - "  Service: {{ agent_status.wazuh.service_state }}"
+          - "Zabbix Agent:"
+          - "  Installed: {{ agent_status.zabbix.installed }}"
+          - "  Service: {{ agent_status.zabbix.service_state }}"
+          - "Tactical RMM Agent:"
+          - "  Installed: {{ agent_status.trmm.installed }}"
+          - "  Service: {{ agent_status.trmm.service_state }}"
+          - "MeshAgent:"
+          - "  Installed: {{ agent_status.meshagent.installed }}"
+          - "  Service: {{ agent_status.meshagent.service_state }}"
+          - "Tailscale:"
+          - "  Installed: {{ agent_status.tailscale.installed }}"
+          - "  Service: {{ agent_status.tailscale.service_state }}"
+          - "  IP: {{ agent_status.tailscale.ip }}"
+          - "============================================"
+
+- name: Generate Agent Status Report
+  hosts: localhost
+  gather_facts: no
+  run_once: true
+
+  tasks:
+    - name: Create summary report
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "=============== AGENT STATUS SUMMARY ==============="
+          - "Install missing agents with:"
+          - "  ansible-playbook playbooks/install-security-agents.yml"
+          - "  ansible-playbook playbooks/install-trmm-agent.yml"
+          - "  ansible-playbook playbooks/install-tailscale.yml"
+          - "===================================================="

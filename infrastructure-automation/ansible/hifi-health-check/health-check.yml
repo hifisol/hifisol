@@ -1,0 +1,694 @@
+---
+# Linux Health Check Playbook
+# Read-only system health assessment for client environments
+#
+# Tags: overview, disk, zfs, memory, thermal, smart, dmesg, network, services, time
+# Additional: slow (deep SMART scan)
+#
+# Usage:
+#   ansible-playbook -i inventory/<client>.ini health-check.yml
+#   ansible-playbook -i inventory/<client>.ini health-check.yml -l srv-1
+#   ansible-playbook -i inventory/<client>.ini health-check.yml --tags disk,smart
+#   ansible-playbook -i inventory/<client>.ini health-check.yml --skip-tags slow
+
+- name: Linux Health Check
+  hosts: linux
+  become: true
+  gather_facts: true
+  vars:
+    # Thresholds (override via vars/defaults.yml or -e)
+    cpu_temp_warn: 75
+    disk_usage_warn: 85
+    ecc_ce_warn: 100
+    smart_reallocated_warn: 50
+    smart_pending_warn: 1
+    load_warn_multiplier: 2
+    swap_usage_warn: 50
+    uptime_warn_days: 180
+
+  tasks:
+    # =========================================================================
+    # System Overview
+    # =========================================================================
+    - name: "[OVERVIEW] System information"
+      set_fact:
+        overview_findings:
+          - check: "Hostname"
+            status: "INFO"
+            severity: "LOW"
+            detail: "{{ ansible_hostname }}"
+            fix: "N/A"
+          - check: "Operating System"
+            status: "INFO"
+            severity: "LOW"
+            detail: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+            fix: "N/A"
+          - check: "Kernel"
+            status: "INFO"
+            severity: "LOW"
+            detail: "{{ ansible_kernel }}"
+            fix: "N/A"
+          - check: "Uptime"
+            status: "{{ 'WARN' if (ansible_uptime_seconds | int // 86400) > uptime_warn_days else 'PASS' }}"
+            severity: "LOW"
+            detail: "{{ ansible_uptime_seconds | int // 86400 }}d {{ (ansible_uptime_seconds | int % 86400) // 3600 }}h ({{ 'exceeds ' + (uptime_warn_days | string) + ' days — schedule reboot' if (ansible_uptime_seconds | int // 86400) > uptime_warn_days else 'OK' }})"
+            fix: "Schedule a maintenance reboot window"
+          - check: "CPU count"
+            status: "INFO"
+            severity: "LOW"
+            detail: "{{ ansible_processor_vcpus }} vCPUs"
+            fix: "N/A"
+          - check: "RAM"
+            status: "{{ 'WARN' if ((ansible_memtotal_mb - ansible_memfree_mb) * 100 / ansible_memtotal_mb) | round(0) | int > 90 else 'PASS' }}"
+            severity: "MEDIUM"
+            detail: "{{ (ansible_memtotal_mb / 1024) | round(1) }} GB total, {{ ((ansible_memtotal_mb - ansible_memfree_mb) * 100 / ansible_memtotal_mb) | round(1) }}% used"
+            fix: "Investigate high memory usage; consider adding RAM or tuning applications"
+          - check: "Load average"
+            status: "{{ 'WARN' if ansible_loadavg['15m'] | float > (ansible_processor_vcpus | int * load_warn_multiplier) else 'PASS' }}"
+            severity: "MEDIUM"
+            detail: "{{ ansible_loadavg['1m'] }} / {{ ansible_loadavg['5m'] }} / {{ ansible_loadavg['15m'] }} (threshold: {{ ansible_processor_vcpus | int * load_warn_multiplier }})"
+            fix: "Investigate high load: top, htop, or sar"
+      tags: [overview]
+
+    - name: "[OVERVIEW] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ overview_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [overview]
+
+    # =========================================================================
+    # Disk / Filesystem Usage
+    # =========================================================================
+    - name: "[DISK] Check filesystem usage"
+      shell: df -h --output=target,pcent,size,avail -x tmpfs -x devtmpfs -x squashfs | tail -n +2
+      register: disk_usage
+      changed_when: false
+      tags: [disk]
+
+    - name: "[DISK] Display filesystem usage"
+      debug:
+        msg: "{{ disk_usage.stdout_lines }}"
+      tags: [disk]
+
+    - name: "[DISK] Flag high disk usage"
+      shell: "df --output=target,pcent -x tmpfs -x devtmpfs -x squashfs | awk 'NR>1 {gsub(/%/,\"\",$2); if($2 > {{ disk_usage_warn }}) print $1\"=\"$2}'"
+      register: disk_warnings
+      changed_when: false
+      tags: [disk]
+
+    - name: "[DISK] Check swap usage"
+      shell: free | awk '/Swap/ {if ($2 > 0) printf "%.0f", $3/$2*100; else print "0"}'
+      register: swap_usage
+      changed_when: false
+      failed_when: false
+      tags: [disk]
+
+    - name: "[DISK] Build findings"
+      set_fact:
+        disk_findings: >-
+          {% set findings = [] %}
+          {% if disk_warnings.stdout | default('') | length > 0 %}
+          {%   for line in disk_warnings.stdout_lines %}
+          {%     set parts = line.split('=') %}
+          {%     set _ = findings.append({
+                   "check": "Disk usage: " + parts[0],
+                   "status": "FAIL" if (parts[1] | int) > 95 else "WARN",
+                   "severity": "CRITICAL" if (parts[1] | int) > 95 else "HIGH",
+                   "detail": parts[0] + " at " + parts[1] + "% (threshold: " + (disk_usage_warn | string) + "%)",
+                   "fix": "Investigate disk usage: du -sh " + parts[0] + "/*"
+                 }) %}
+          {%   endfor %}
+          {% else %}
+          {%   set _ = findings.append({
+                 "check": "Disk usage",
+                 "status": "PASS",
+                 "severity": "HIGH",
+                 "detail": "All filesystems below " + (disk_usage_warn | string) + "%",
+                 "fix": "N/A"
+               }) %}
+          {% endif %}
+          {% set swap_pct = swap_usage.stdout | default('0') | int %}
+          {% set _ = findings.append({
+               "check": "Swap usage",
+               "status": "WARN" if swap_pct > swap_usage_warn else "PASS",
+               "severity": "MEDIUM",
+               "detail": (swap_pct | string) + "% swap used",
+               "fix": "Investigate memory pressure; consider adding RAM"
+             }) %}
+          {{ findings }}
+      tags: [disk]
+
+    - name: "[DISK] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ disk_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [disk]
+
+    # =========================================================================
+    # ZFS (if present)
+    # =========================================================================
+    - name: "[ZFS] Check if zpool exists"
+      command: which zpool
+      register: zpool_check
+      changed_when: false
+      failed_when: false
+      tags: [zfs]
+
+    - name: "[ZFS] Pool status"
+      command: zpool status -x
+      register: zpool_status
+      changed_when: false
+      when: zpool_check.rc == 0
+      tags: [zfs]
+
+    - name: "[ZFS] Pool usage"
+      command: zpool list -o name,size,alloc,free,cap,health
+      register: zpool_list
+      changed_when: false
+      when: zpool_check.rc == 0
+      tags: [zfs]
+
+    - name: "[ZFS] Build findings"
+      set_fact:
+        zfs_findings: >-
+          {% set findings = [] %}
+          {% if zpool_check.rc == 0 %}
+          {%   set _ = findings.append({
+                 "check": "ZFS pool health",
+                 "status": "PASS" if (zpool_status.stdout | default('')) == 'all pools are healthy' else "FAIL",
+                 "severity": "CRITICAL",
+                 "detail": zpool_status.stdout | default('unknown'),
+                 "fix": "Run zpool status -v for details; replace degraded drives"
+               }) %}
+          {% else %}
+          {%   set _ = findings.append({
+                 "check": "ZFS",
+                 "status": "SKIP",
+                 "severity": "LOW",
+                 "detail": "ZFS not installed",
+                 "fix": "N/A"
+               }) %}
+          {% endif %}
+          {{ findings }}
+      tags: [zfs]
+
+    - name: "[ZFS] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ zfs_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [zfs]
+
+    - name: "[ZFS] Pool listing"
+      debug:
+        msg: "{{ zpool_list.stdout_lines }}"
+      when: zpool_check.rc == 0
+      tags: [zfs]
+
+    # =========================================================================
+    # ECC Memory (EDAC)
+    # =========================================================================
+    - name: "[MEMORY] Check for EDAC (ECC)"
+      stat:
+        path: /sys/devices/system/edac/mc
+      register: edac_path
+      tags: [memory]
+
+    - name: "[MEMORY] Read ECC correctable errors"
+      shell: |
+        total=0
+        for f in /sys/devices/system/edac/mc/mc*/ce_count; do
+          val=$(cat "$f")
+          total=$((total + val))
+        done
+        echo "$total"
+      register: ecc_ce
+      changed_when: false
+      when: edac_path.stat.exists
+      tags: [memory]
+
+    - name: "[MEMORY] Read ECC uncorrectable errors"
+      shell: |
+        total=0
+        for f in /sys/devices/system/edac/mc/mc*/ue_count; do
+          val=$(cat "$f")
+          total=$((total + val))
+        done
+        echo "$total"
+      register: ecc_ue
+      changed_when: false
+      when: edac_path.stat.exists
+      tags: [memory]
+
+    - name: "[MEMORY] Build findings"
+      set_fact:
+        memory_findings: >-
+          {% set findings = [] %}
+          {% if edac_path.stat.exists %}
+          {%   set ce = ecc_ce.stdout | default('0') | int %}
+          {%   set ue = ecc_ue.stdout | default('0') | int %}
+          {%   set _ = findings.append({
+                 "check": "ECC correctable errors",
+                 "status": "WARN" if ce > ecc_ce_warn else "PASS",
+                 "severity": "HIGH",
+                 "detail": (ce | string) + " correctable errors (threshold: " + (ecc_ce_warn | string) + ")",
+                 "fix": "DIMMs may be degrading; run memtest86+ and plan replacement"
+               }) %}
+          {%   set _ = findings.append({
+                 "check": "ECC uncorrectable errors",
+                 "status": "FAIL" if ue > 0 else "PASS",
+                 "severity": "CRITICAL",
+                 "detail": (ue | string) + " uncorrectable errors",
+                 "fix": "Data corruption risk — investigate and replace faulty DIMMs immediately"
+               }) %}
+          {% else %}
+          {%   set _ = findings.append({
+                 "check": "ECC memory",
+                 "status": "SKIP",
+                 "severity": "LOW",
+                 "detail": "EDAC not available (no ECC or driver not loaded)",
+                 "fix": "N/A"
+               }) %}
+          {% endif %}
+          {{ findings }}
+      tags: [memory]
+
+    - name: "[MEMORY] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ memory_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [memory]
+
+    # =========================================================================
+    # CPU Temperature
+    # =========================================================================
+    - name: "[THERMAL] Check if sensors available"
+      command: which sensors
+      register: sensors_check
+      changed_when: false
+      failed_when: false
+      tags: [thermal]
+
+    - name: "[THERMAL] Read CPU temperatures"
+      shell: sensors 2>/dev/null | grep -E "^(Core|coretemp|Package)" || echo "No temp data"
+      register: cpu_temps
+      changed_when: false
+      when: sensors_check.rc == 0
+      tags: [thermal]
+
+    - name: "[THERMAL] Get max core temp"
+      shell: "sensors 2>/dev/null | grep -oP 'Core \\d+:\\s+\\+\\K[\\d.]+' | sort -n | tail -1 || echo 0"
+      register: max_temp
+      changed_when: false
+      when: sensors_check.rc == 0
+      tags: [thermal]
+
+    - name: "[THERMAL] Build findings"
+      set_fact:
+        thermal_findings: >-
+          {% set findings = [] %}
+          {% if sensors_check.rc == 0 %}
+          {%   set temp = max_temp.stdout | default('0') | float %}
+          {%   set _ = findings.append({
+                 "check": "CPU temperature",
+                 "status": "FAIL" if temp > 90 else ("WARN" if temp > cpu_temp_warn else "PASS"),
+                 "severity": "CRITICAL" if temp > 90 else ("HIGH" if temp > cpu_temp_warn else "LOW"),
+                 "detail": "Max core temp: " + (temp | string) + "C (threshold: " + (cpu_temp_warn | string) + "C)",
+                 "fix": "Check fans, thermal paste, and airflow; clean dust"
+               }) %}
+          {% else %}
+          {%   set _ = findings.append({
+                 "check": "CPU temperature",
+                 "status": "SKIP",
+                 "severity": "LOW",
+                 "detail": "lm-sensors not installed",
+                 "fix": "apt install lm-sensors && sensors-detect"
+               }) %}
+          {% endif %}
+          {{ findings }}
+      tags: [thermal]
+
+    - name: "[THERMAL] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ thermal_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [thermal]
+
+    - name: "[THERMAL] Temperature detail"
+      debug:
+        msg: "{{ cpu_temps.stdout_lines }}"
+      when: sensors_check.rc == 0
+      tags: [thermal]
+
+    # =========================================================================
+    # SMART Disk Health
+    # =========================================================================
+    - name: "[SMART] Check if smartctl available"
+      command: which smartctl
+      register: smartctl_check
+      changed_when: false
+      failed_when: false
+      tags: [smart]
+
+    - name: "[SMART] Health check all drives"
+      shell: |
+        for dev in /dev/sd? /dev/nvme?n?; do
+          [ -b "$dev" ] || continue
+          health=$(smartctl -H "$dev" 2>/dev/null | grep -oP '(PASSED|FAILED)' || echo "UNKNOWN")
+          model=$(smartctl -i "$dev" 2>/dev/null | grep -oP '(Device Model|Model Number):\s+\K.*' || echo "unknown")
+          hours=$(smartctl -A "$dev" 2>/dev/null | grep Power_On_Hours | awk '{print $NF}')
+          reallocated=$(smartctl -A "$dev" 2>/dev/null | grep Reallocated_Sector_Ct | awk '{print $NF}')
+          pending=$(smartctl -A "$dev" 2>/dev/null | grep Current_Pending_Sector | awk '{print $NF}')
+          wear=$(smartctl -A "$dev" 2>/dev/null | grep -E "Wear_Leveling|Media_Wearout|Percentage_Used" | awk '{print $NF}')
+          temp=$(smartctl -A "$dev" 2>/dev/null | grep -E "Temperature_Celsius|Airflow_Temperature" | head -1 | awk '{print $NF}')
+          echo "$dev|$health|$model|${hours:-n/a}|${reallocated:-n/a}|${pending:-n/a}|${wear:-n/a}|${temp:-n/a}"
+        done
+      register: smart_health
+      changed_when: false
+      when: smartctl_check.rc == 0
+      tags: [smart]
+
+    - name: "[SMART] Build findings"
+      set_fact:
+        smart_findings: >-
+          {% set findings = [] %}
+          {% if smartctl_check.rc | default(1) != 0 %}
+          {%   set _ = findings.append({
+                 "check": "SMART",
+                 "status": "SKIP",
+                 "severity": "LOW",
+                 "detail": "smartctl not installed",
+                 "fix": "apt install smartmontools"
+               }) %}
+          {% else %}
+          {%   for line in smart_health.stdout_lines | default([]) %}
+          {%     set parts = line.split('|') %}
+          {%     if parts | length >= 6 %}
+          {%       set dev = parts[0] %}
+          {%       set health = parts[1] %}
+          {%       set model = parts[2] %}
+          {%       set reallocated = parts[4] | default('0') %}
+          {%       set pending = parts[5] | default('0') %}
+          {%       if health == 'FAILED' %}
+          {%         set _ = findings.append({
+                       "check": "SMART health: " + dev,
+                       "status": "FAIL",
+                       "severity": "CRITICAL",
+                       "detail": dev + " (" + model + ") SMART FAILED",
+                       "fix": "Drive failing — back up data and replace immediately"
+                     }) %}
+          {%       elif reallocated != 'n/a' and (reallocated | int) > smart_reallocated_warn %}
+          {%         set _ = findings.append({
+                       "check": "SMART health: " + dev,
+                       "status": "WARN",
+                       "severity": "HIGH",
+                       "detail": dev + " (" + model + ") " + reallocated + " reallocated sectors",
+                       "fix": "Drive degrading — plan replacement"
+                     }) %}
+          {%       elif pending != 'n/a' and (pending | int) > 0 %}
+          {%         set _ = findings.append({
+                       "check": "SMART health: " + dev,
+                       "status": "WARN",
+                       "severity": "HIGH",
+                       "detail": dev + " (" + model + ") " + pending + " pending sectors",
+                       "fix": "Drive has pending sectors — monitor closely"
+                     }) %}
+          {%       else %}
+          {%         set _ = findings.append({
+                       "check": "SMART health: " + dev,
+                       "status": "PASS",
+                       "severity": "HIGH",
+                       "detail": dev + " (" + model + ") PASSED | hours=" + (parts[3] | default('n/a')),
+                       "fix": "N/A"
+                     }) %}
+          {%       endif %}
+          {%     endif %}
+          {%   endfor %}
+          {% endif %}
+          {{ findings }}
+      tags: [smart]
+
+    - name: "[SMART] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ smart_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [smart]
+
+    # =========================================================================
+    # dmesg Hardware Errors
+    # =========================================================================
+    - name: "[DMESG] Check for hardware errors"
+      shell: dmesg | grep -iE "hardware error|mce|machine.check|Memory failure|I/O error|ata.*error|GHES|critical" | tail -20 || true
+      register: dmesg_errors
+      changed_when: false
+      tags: [dmesg]
+
+    - name: "[DMESG] Build findings"
+      set_fact:
+        dmesg_findings:
+          - check: "Kernel hardware errors"
+            status: "{{ 'WARN' if (dmesg_errors.stdout | default('') | length) > 0 else 'PASS' }}"
+            severity: "HIGH"
+            detail: "{{ (dmesg_errors.stdout_lines | default([]) | length | string) + ' hardware error lines in dmesg' if (dmesg_errors.stdout | default('') | length) > 0 else 'No hardware errors in dmesg' }}"
+            fix: "Review dmesg output; may indicate failing hardware"
+      tags: [dmesg]
+
+    - name: "[DMESG] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ dmesg_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [dmesg]
+
+    - name: "[DMESG] Error detail"
+      debug:
+        msg: "{{ dmesg_errors.stdout_lines }}"
+      when: dmesg_errors.stdout | length > 0
+      tags: [dmesg]
+
+    # =========================================================================
+    # Network
+    # =========================================================================
+    - name: "[NETWORK] Check interfaces"
+      shell: ip -br link show | grep -v "^lo"
+      register: net_links
+      changed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Check for bond interfaces"
+      shell: ls /proc/net/bonding/ 2>/dev/null || echo "none"
+      register: bond_check
+      changed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Check DNS resolution"
+      shell: host google.com >/dev/null 2>&1 && echo "OK" || echo "FAIL"
+      register: dns_check
+      changed_when: false
+      failed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Check default gateway"
+      shell: ip route show default | head -1 || echo "none"
+      register: default_gw
+      changed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Build findings"
+      set_fact:
+        network_findings:
+          - check: "DNS resolution"
+            status: "{{ 'PASS' if (dns_check.stdout | default('')) == 'OK' else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "DNS {{ dns_check.stdout | default('unknown') }}"
+            fix: "Check /etc/resolv.conf and network connectivity"
+          - check: "Default gateway"
+            status: "{{ 'PASS' if (default_gw.stdout | default('none')) != 'none' else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "{{ default_gw.stdout | default('none') }}"
+            fix: "Check network configuration"
+          - check: "Bond interfaces"
+            status: "{{ 'INFO' if (bond_check.stdout | default('none')) != 'none' else 'SKIP' }}"
+            severity: "LOW"
+            detail: "{{ 'Bonds: ' + bond_check.stdout if (bond_check.stdout | default('none')) != 'none' else 'No bond interfaces' }}"
+            fix: "N/A"
+      tags: [network]
+
+    - name: "[NETWORK] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ network_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [network]
+
+    - name: "[NETWORK] Interface listing"
+      debug:
+        msg: "{{ net_links.stdout_lines }}"
+      tags: [network]
+
+    # =========================================================================
+    # Services
+    # =========================================================================
+    - name: "[SERVICES] Check failed systemd units"
+      shell: systemctl --failed --no-legend --no-pager | head -20
+      register: failed_units
+      changed_when: false
+      tags: [services]
+
+    - name: "[SERVICES] Check key services"
+      shell: "systemctl is-active {{ item }} 2>/dev/null || echo inactive"
+      register: key_services
+      changed_when: false
+      failed_when: false
+      loop:
+        - sshd
+        - cron
+      tags: [services]
+
+    - name: "[SERVICES] Build findings"
+      set_fact:
+        services_findings: >-
+          {% set findings = [] %}
+          {% set _ = findings.append({
+               "check": "Failed systemd units",
+               "status": "PASS" if (failed_units.stdout | default('') | length) == 0 else "WARN",
+               "severity": "MEDIUM",
+               "detail": (failed_units.stdout | default('none')) if (failed_units.stdout | default('') | length) > 0 else "No failed units",
+               "fix": "Investigate: systemctl status <unit>"
+             }) %}
+          {% for result in key_services.results | default([]) %}
+          {%   set _ = findings.append({
+                 "check": "Service: " + result.item,
+                 "status": "PASS" if result.stdout == 'active' else "FAIL",
+                 "severity": "HIGH",
+                 "detail": result.item + ": " + result.stdout,
+                 "fix": "systemctl enable --now " + result.item
+               }) %}
+          {% endfor %}
+          {{ findings }}
+      tags: [services]
+
+    - name: "[SERVICES] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ services_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [services]
+
+    # =========================================================================
+    # Time / NTP
+    # =========================================================================
+    - name: "[TIME] Check NTP synchronization"
+      shell: timedatectl show --property=NTPSynchronized --value 2>/dev/null || echo "unknown"
+      register: ntp_sync
+      changed_when: false
+      tags: [time]
+
+    - name: "[TIME] Build findings"
+      set_fact:
+        time_findings:
+          - check: "NTP synchronization"
+            status: "{{ 'PASS' if (ntp_sync.stdout | default('')) == 'yes' else 'FAIL' }}"
+            severity: "MEDIUM"
+            detail: "System time: {{ ansible_date_time.iso8601 }} | NTP synced: {{ ntp_sync.stdout | default('unknown') }}"
+            fix: "Configure NTP: timedatectl set-ntp true"
+      tags: [time]
+
+    - name: "[TIME] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ time_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [time]
+
+    # =========================================================================
+    # Aggregate all findings
+    # =========================================================================
+    - name: "[SUMMARY] Aggregate all findings"
+      set_fact:
+        all_findings: >-
+          {{
+            (overview_findings | default([])) +
+            (disk_findings | default([])) +
+            (zfs_findings | default([])) +
+            (memory_findings | default([])) +
+            (thermal_findings | default([])) +
+            (smart_findings | default([])) +
+            (dmesg_findings | default([])) +
+            (network_findings | default([])) +
+            (services_findings | default([])) +
+            (time_findings | default([]))
+          }}
+      tags: [always]
+
+    - name: "[SUMMARY] Count results"
+      set_fact:
+        pass_count: "{{ all_findings | selectattr('status', 'equalto', 'PASS') | list | length }}"
+        fail_count: "{{ all_findings | selectattr('status', 'equalto', 'FAIL') | list | length }}"
+        warn_count: "{{ all_findings | selectattr('status', 'equalto', 'WARN') | list | length }}"
+        critical_count: "{{ all_findings | selectattr('severity', 'equalto', 'CRITICAL') | selectattr('status', 'in', ['FAIL', 'WARN']) | list | length }}"
+      tags: [always]
+
+    - name: "[SUMMARY] Display summary"
+      debug:
+        msg:
+          - "========================================="
+          - "  HEALTH CHECK SUMMARY: {{ inventory_hostname }}"
+          - "========================================="
+          - "  PASS: {{ pass_count }} | FAIL: {{ fail_count }} | WARN: {{ warn_count }}"
+          - "  CRITICAL issues: {{ critical_count }}"
+          - "========================================="
+      tags: [always]
+
+    - name: "[SUMMARY] List issues"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ all_findings | selectattr('status', 'in', ['FAIL', 'WARN']) | list }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [always]
+
+# =============================================================================
+# Report Generation
+# =============================================================================
+- name: Generate Health Check Report
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  tags: [always]
+  vars:
+    report_date: "{{ ansible_date_time.date }}"
+    report_dir: "{{ lookup('env', 'HOME') }}/HiFi Solutions/Ansible/hifi-health-check/reports"
+    report_file: "{{ report_dir }}/health-check-{{ ansible_date_time.date }}.md"
+
+  tasks:
+    - name: "[REPORT] Create reports directory"
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: "[REPORT] Generate markdown report"
+      template:
+        src: templates/health-report.md.j2
+        dest: "{{ report_file }}"
+        mode: "0644"
+
+    - name: "[REPORT] Report location"
+      debug:
+        msg: "Health check report written to: {{ report_file }}"

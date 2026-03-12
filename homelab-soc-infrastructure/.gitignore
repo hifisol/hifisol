@@ -1,0 +1,30 @@
+# Secrets
+.env
+*.secret
+*.key
+*.pem
+
+# Ansible vault files
+ansible/vars/vault.yml
+ansible/vars/*.vault.yml
+
+# Actual inventory (use examples as templates)
+ansible/inventory/hosts.yml
+ansible/vars/ad-lab.yml
+
+# Ansible retry files
+*.retry
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Temp files
+/tmp/

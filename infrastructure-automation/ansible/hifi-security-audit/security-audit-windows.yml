@@ -1,0 +1,818 @@
+---
+# Windows Security Baseline Assessment Playbook
+# Read-only audit — no changes are made to hosts
+# Requires WinRM connectivity (pywinrm on control node)
+#
+# Tags: rdp, firewall, services, filesystem, patches, auth, audit, network, agents
+#
+# Usage:
+#   ansible-playbook -i inventory/<client>.ini security-audit-windows.yml
+#   ansible-playbook -i inventory/<client>.ini security-audit-windows.yml -l win-srv-1
+#   ansible-playbook -i inventory/<client>.ini security-audit-windows.yml --tags rdp,patches
+
+- name: Windows Security Baseline Assessment
+  hosts: windows
+  gather_facts: true
+  vars:
+    # Dangerous services that should be disabled
+    dangerous_services_win:
+      - RemoteRegistry
+      - Telnet
+      - SNMP
+      - SSDPSRV
+      - lltdsvc
+      - WMPNetworkSvc
+    # Required services
+    required_services_win:
+      - WinDefend
+      - EventLog
+      - MpsSvc
+      - WuauServ
+      - wazuh
+    # Audit subcategories to verify
+    audit_subcategories:
+      - { name: "Logon", expected: "Success and Failure" }
+      - { name: "Logoff", expected: "Success" }
+      - { name: "Account Lockout", expected: "Failure" }
+      - { name: "User Account Management", expected: "Success and Failure" }
+      - { name: "Security Group Management", expected: "Success and Failure" }
+      - { name: "Process Creation", expected: "Success" }
+      - { name: "Policy Change", expected: "Success and Failure" }
+      - { name: "Sensitive Privilege Use", expected: "Success and Failure" }
+
+  tasks:
+    # =========================================================================
+    # RDP Hardening Checks
+    # =========================================================================
+    - name: "[RDP] Check NLA requirement"
+      win_reg_stat:
+        path: HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp
+        name: UserAuthentication
+      register: rdp_nla
+      failed_when: false
+      tags: [rdp]
+
+    - name: "[RDP] Check encryption level"
+      win_reg_stat:
+        path: HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp
+        name: MinEncryptionLevel
+      register: rdp_encryption
+      failed_when: false
+      tags: [rdp]
+
+    - name: "[RDP] Check RDP enabled status"
+      win_reg_stat:
+        path: HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server
+        name: fDenyTSConnections
+      register: rdp_deny
+      failed_when: false
+      tags: [rdp]
+
+    - name: "[RDP] Check RDP port"
+      win_reg_stat:
+        path: HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp
+        name: PortNumber
+      register: rdp_port
+      failed_when: false
+      tags: [rdp]
+
+    - name: "[RDP] Build findings"
+      set_fact:
+        rdp_findings:
+          - check: "NLA required for RDP"
+            status: "{{ 'PASS' if (rdp_nla.value | default(0) | int) == 1 else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "UserAuthentication = {{ rdp_nla.value | default('not set') }}"
+            fix: "Set HKLM:\\...\\RDP-Tcp\\UserAuthentication to 1, or apply GPO"
+          - check: "RDP encryption level"
+            status: "{{ 'PASS' if (rdp_encryption.value | default(0) | int) >= 3 else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "MinEncryptionLevel = {{ rdp_encryption.value | default('not set') }} (3=High)"
+            fix: "Set MinEncryptionLevel to 3 (High) via GPO or registry"
+          - check: "RDP access restricted"
+            status: "{{ 'PASS' if (rdp_deny.value | default(0) | int) == 1 else 'INFO' }}"
+            severity: "MEDIUM"
+            detail: "fDenyTSConnections = {{ rdp_deny.value | default('not set') }} (1=disabled, 0=enabled)"
+            fix: "Disable RDP if not needed, or restrict via firewall rules"
+      tags: [rdp]
+
+    - name: "[RDP] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ rdp_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [rdp]
+
+    # =========================================================================
+    # Windows Firewall Checks
+    # =========================================================================
+    - name: "[FIREWALL] Check firewall profiles"
+      win_shell: |
+        Get-NetFirewallProfile | Select-Object Name, Enabled, DefaultInboundAction, DefaultOutboundAction | ConvertTo-Json
+      register: fw_profiles
+      changed_when: false
+      tags: [firewall]
+
+    - name: "[FIREWALL] Parse firewall profiles"
+      set_fact:
+        fw_data: "{{ fw_profiles.stdout | from_json }}"
+      failed_when: false
+      tags: [firewall]
+
+    - name: "[FIREWALL] Check open inbound ports"
+      win_shell: |
+        Get-NetTCPConnection -State Listen | Select-Object LocalPort, OwningProcess | Sort-Object LocalPort -Unique | ConvertTo-Json
+      register: win_open_ports
+      changed_when: false
+      failed_when: false
+      tags: [firewall]
+
+    - name: "[FIREWALL] Build findings"
+      set_fact:
+        firewall_findings: >-
+          {% set findings = [] %}
+          {% set profiles = fw_data if fw_data is iterable and fw_data is not string else [] %}
+          {% for profile in profiles %}
+          {%   set enabled = profile.Enabled | default(false) %}
+          {%   set inbound = profile.DefaultInboundAction | default(0) %}
+          {%   set name = profile.Name | default('Unknown') %}
+          {%   set _ = findings.append({
+                 "check": name + " profile enabled",
+                 "status": "PASS" if enabled else "FAIL",
+                 "severity": "CRITICAL",
+                 "detail": name + " firewall " + ("enabled" if enabled else "DISABLED"),
+                 "fix": "Set-NetFirewallProfile -Profile " + name + " -Enabled True"
+               }) %}
+          {%   set _ = findings.append({
+                 "check": name + " default inbound block",
+                 "status": "PASS" if (inbound | int) == 4 else "FAIL",
+                 "severity": "HIGH",
+                 "detail": name + " inbound action = " + (inbound | string) + " (4=Block, 2=Allow)",
+                 "fix": "Set-NetFirewallProfile -Profile " + name + " -DefaultInboundAction Block"
+               }) %}
+          {% endfor %}
+          {{ findings }}
+      tags: [firewall]
+
+    - name: "[FIREWALL] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ firewall_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [firewall]
+
+    # =========================================================================
+    # Service Hardening Checks
+    # =========================================================================
+    - name: "[SERVICES] Check dangerous services"
+      win_service:
+        name: "{{ item }}"
+      register: dangerous_svc_win
+      failed_when: false
+      loop: "{{ dangerous_services_win }}"
+      tags: [services]
+
+    - name: "[SERVICES] Check required services"
+      win_service:
+        name: "{{ item }}"
+      register: required_svc_win
+      failed_when: false
+      loop: "{{ required_services_win }}"
+      tags: [services]
+
+    - name: "[SERVICES] Build findings"
+      set_fact:
+        services_findings: >-
+          {% set findings = [] %}
+          {% for result in dangerous_svc_win.results | default([]) %}
+          {%   set svc_state = result.state | default('absent') %}
+          {%   set status = "FAIL" if svc_state == 'running' else "PASS" %}
+          {%   set _ = findings.append({
+                 "check": "Dangerous service: " + result.item,
+                 "status": status,
+                 "severity": "HIGH",
+                 "detail": result.item + " is " + svc_state,
+                 "fix": "Stop-Service " + result.item + " -Force; Set-Service " + result.item + " -StartupType Disabled"
+               }) %}
+          {% endfor %}
+          {% for result in required_svc_win.results | default([]) %}
+          {%   set svc_state = result.state | default('absent') %}
+          {%   set status = "PASS" if svc_state == 'running' else "FAIL" %}
+          {%   set _ = findings.append({
+                 "check": "Required service: " + result.item,
+                 "status": status,
+                 "severity": "HIGH",
+                 "detail": result.item + " is " + svc_state,
+                 "fix": "Set-Service " + result.item + " -StartupType Automatic; Start-Service " + result.item
+               }) %}
+          {% endfor %}
+          {{ findings }}
+      tags: [services]
+
+    - name: "[SERVICES] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ services_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [services]
+
+    # =========================================================================
+    # Filesystem & SMB Checks
+    # =========================================================================
+    - name: "[FILESYSTEM] Check SMB signing required"
+      win_reg_stat:
+        path: HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters
+        name: RequireSecuritySignature
+      register: smb_signing
+      failed_when: false
+      tags: [filesystem]
+
+    - name: "[FILESYSTEM] Check SMBv1 disabled"
+      win_shell: |
+        (Get-SmbServerConfiguration).EnableSMB1Protocol
+      register: smb1_status
+      changed_when: false
+      failed_when: false
+      tags: [filesystem]
+
+    - name: "[FILESYSTEM] Check admin shares"
+      win_shell: |
+        Get-SmbShare | Where-Object { $_.Name -match '\$$' } | Select-Object Name, Path | ConvertTo-Json
+      register: admin_shares
+      changed_when: false
+      failed_when: false
+      tags: [filesystem]
+
+    - name: "[FILESYSTEM] Check BitLocker status"
+      win_shell: |
+        Get-BitLockerVolume -MountPoint C: 2>$null | Select-Object MountPoint, ProtectionStatus, EncryptionPercentage | ConvertTo-Json
+      register: bitlocker_status
+      changed_when: false
+      failed_when: false
+      tags: [filesystem]
+
+    - name: "[FILESYSTEM] Build findings"
+      set_fact:
+        filesystem_findings:
+          - check: "SMB signing required"
+            status: "{{ 'PASS' if (smb_signing.value | default(0) | int) == 1 else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "RequireSecuritySignature = {{ smb_signing.value | default('not set') }}"
+            fix: "Set-SmbServerConfiguration -RequireSecuritySignature $true -Force"
+          - check: "SMBv1 disabled"
+            status: "{{ 'PASS' if (smb1_status.stdout | default('') | trim | lower) == 'false' else 'FAIL' }}"
+            severity: "CRITICAL"
+            detail: "SMBv1 enabled = {{ smb1_status.stdout | default('unknown') | trim }}"
+            fix: "Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart"
+          - check: "BitLocker on C:"
+            status: "{{ 'PASS' if (bitlocker_status.stdout | default('')) is search('\"ProtectionStatus\"\\s*:\\s*1') else 'WARN' }}"
+            severity: "MEDIUM"
+            detail: "{{ bitlocker_status.stdout | default('Not available') | trim }}"
+            fix: "Enable-BitLocker -MountPoint C: -EncryptionMethod XtsAes256 -UsedSpaceOnly"
+      tags: [filesystem]
+
+    - name: "[FILESYSTEM] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ filesystem_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [filesystem]
+
+    # =========================================================================
+    # Patch Status Checks
+    # =========================================================================
+    - name: "[PATCHES] Check pending Windows updates"
+      win_shell: |
+        $Session = New-Object -ComObject Microsoft.Update.Session
+        $Searcher = $Session.CreateUpdateSearcher()
+        $Results = $Searcher.Search("IsInstalled=0")
+        $Results.Updates.Count
+      register: win_pending_updates
+      changed_when: false
+      failed_when: false
+      tags: [patches]
+
+    - name: "[PATCHES] List pending updates"
+      win_shell: |
+        $Session = New-Object -ComObject Microsoft.Update.Session
+        $Searcher = $Session.CreateUpdateSearcher()
+        $Results = $Searcher.Search("IsInstalled=0")
+        $Results.Updates | ForEach-Object { "$($_.MsrcSeverity) - $($_.Title)" } | Select-Object -First 20
+      register: win_pending_list
+      changed_when: false
+      failed_when: false
+      tags: [patches]
+
+    - name: "[PATCHES] Check last update install date"
+      win_shell: |
+        $Session = New-Object -ComObject Microsoft.Update.Session
+        $Searcher = $Session.CreateUpdateSearcher()
+        $HistoryCount = $Searcher.GetTotalHistoryCount()
+        if ($HistoryCount -gt 0) { ($Searcher.QueryHistory(0,1)).Date.ToString("yyyy-MM-dd") } else { "Never" }
+      register: win_last_update
+      changed_when: false
+      failed_when: false
+      tags: [patches]
+
+    - name: "[PATCHES] Check Windows Update service"
+      win_service:
+        name: wuauserv
+      register: wuauserv_status
+      failed_when: false
+      tags: [patches]
+
+    - name: "[PATCHES] Check pending reboot"
+      win_reg_stat:
+        path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing
+        name: RebootPending
+      register: win_reboot_pending
+      failed_when: false
+      tags: [patches]
+
+    - name: "[PATCHES] Check OS build"
+      win_shell: |
+        (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").DisplayVersion + " (Build " + (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").CurrentBuildNumber + ")"
+      register: win_os_build
+      changed_when: false
+      failed_when: false
+      tags: [patches]
+
+    - name: "[PATCHES] Build findings"
+      set_fact:
+        patches_findings:
+          - check: "Pending Windows updates"
+            status: "{{ 'PASS' if (win_pending_updates.stdout | default('0') | trim | int) == 0 else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "{{ win_pending_updates.stdout | default('0') | trim }} updates pending"
+            fix: "Install-WindowsUpdate -AcceptAll or run Windows Update"
+          - check: "Windows Update service"
+            status: "{{ 'PASS' if (wuauserv_status.state | default('')) == 'running' else 'WARN' }}"
+            severity: "MEDIUM"
+            detail: "wuauserv: {{ wuauserv_status.state | default('unknown') }}"
+            fix: "Set-Service wuauserv -StartupType Automatic; Start-Service wuauserv"
+          - check: "Last update installed"
+            status: "INFO"
+            severity: "MEDIUM"
+            detail: "Last update: {{ win_last_update.stdout | default('unknown') | trim }}"
+            fix: "N/A"
+          - check: "OS build"
+            status: "INFO"
+            severity: "LOW"
+            detail: "{{ win_os_build.stdout | default('unknown') | trim }}"
+            fix: "N/A"
+          - check: "Reboot pending"
+            status: "{{ 'WARN' if (win_reboot_pending.exists | default(false)) else 'PASS' }}"
+            severity: "MEDIUM"
+            detail: "Reboot {{ 'required' if (win_reboot_pending.exists | default(false)) else 'not required' }}"
+            fix: "Schedule a maintenance reboot"
+      tags: [patches]
+
+    - name: "[PATCHES] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ patches_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [patches]
+
+    - name: "[PATCHES] Pending updates detail"
+      debug:
+        msg: "{{ win_pending_list.stdout_lines | default([]) }}"
+      when: (win_pending_updates.stdout | default('0') | trim | int) > 0
+      tags: [patches]
+
+    # =========================================================================
+    # Authentication & Access Control Checks
+    # =========================================================================
+    - name: "[AUTH] Get password policy"
+      win_shell: |
+        net accounts
+      register: win_password_policy
+      changed_when: false
+      failed_when: false
+      tags: [auth]
+
+    - name: "[AUTH] Check minimum password length"
+      win_shell: |
+        (net accounts | Select-String "Minimum password length").ToString().Split(":")[1].Trim()
+      register: win_min_pass_len
+      changed_when: false
+      failed_when: false
+      tags: [auth]
+
+    - name: "[AUTH] Check account lockout threshold"
+      win_shell: |
+        (net accounts | Select-String "Lockout threshold").ToString().Split(":")[1].Trim()
+      register: win_lockout_threshold
+      changed_when: false
+      failed_when: false
+      tags: [auth]
+
+    - name: "[AUTH] Check guest account disabled"
+      win_shell: |
+        (Get-LocalUser -Name "Guest" -ErrorAction SilentlyContinue).Enabled
+      register: win_guest_account
+      changed_when: false
+      failed_when: false
+      tags: [auth]
+
+    - name: "[AUTH] Check Administrator account renamed"
+      win_shell: |
+        (Get-LocalUser | Where-Object { $_.SID -like "*-500" }).Name
+      register: win_admin_name
+      changed_when: false
+      failed_when: false
+      tags: [auth]
+
+    - name: "[AUTH] Check UAC enabled"
+      win_reg_stat:
+        path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+        name: EnableLUA
+      register: win_uac
+      failed_when: false
+      tags: [auth]
+
+    - name: "[AUTH] Check legal notice"
+      win_reg_stat:
+        path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+        name: legalnoticecaption
+      register: win_legal_notice
+      failed_when: false
+      tags: [auth]
+
+    - name: "[AUTH] Build findings"
+      set_fact:
+        auth_findings:
+          - check: "Minimum password length"
+            status: "{{ 'PASS' if (win_min_pass_len.stdout | default('0') | trim | int) >= 14 else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "Minimum length: {{ win_min_pass_len.stdout | default('unknown') | trim }} (expected >= 14)"
+            fix: "net accounts /minpwlen:14"
+          - check: "Account lockout threshold"
+            status: "{{ 'PASS' if (win_lockout_threshold.stdout | default('Never') | trim) != 'Never' and (win_lockout_threshold.stdout | default('0') | trim | int) <= 5 else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "Lockout threshold: {{ win_lockout_threshold.stdout | default('unknown') | trim }}"
+            fix: "net accounts /lockoutthreshold:5"
+          - check: "Guest account disabled"
+            status: "{{ 'PASS' if (win_guest_account.stdout | default('') | trim | lower) == 'false' else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "Guest enabled: {{ win_guest_account.stdout | default('unknown') | trim }}"
+            fix: "Disable-LocalUser -Name Guest"
+          - check: "Administrator account renamed"
+            status: "{{ 'PASS' if (win_admin_name.stdout | default('Administrator') | trim) != 'Administrator' else 'WARN' }}"
+            severity: "MEDIUM"
+            detail: "Admin account name: {{ win_admin_name.stdout | default('unknown') | trim }}"
+            fix: "Rename-LocalUser -Name Administrator -NewName <custom-name>"
+          - check: "UAC enabled"
+            status: "{{ 'PASS' if (win_uac.value | default(0) | int) == 1 else 'FAIL' }}"
+            severity: "CRITICAL"
+            detail: "EnableLUA = {{ win_uac.value | default('not set') }}"
+            fix: "Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System' -Name EnableLUA -Value 1"
+          - check: "Legal notice / login banner"
+            status: "{{ 'PASS' if (win_legal_notice.value | default('') | length) > 0 else 'FAIL' }}"
+            severity: "MEDIUM"
+            detail: "Legal notice {{ 'configured' if (win_legal_notice.value | default('') | length) > 0 else 'not configured' }}"
+            fix: "Configure via GPO: Computer Configuration > Windows Settings > Security Settings > Local Policies > Security Options"
+      tags: [auth]
+
+    - name: "[AUTH] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ auth_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [auth]
+
+    # =========================================================================
+    # Audit Policy Checks
+    # =========================================================================
+    - name: "[AUDIT] Get audit policy"
+      win_shell: |
+        auditpol /get /category:* | Where-Object { $_ -match "^\s+\S" }
+      register: win_audit_policy
+      changed_when: false
+      failed_when: false
+      tags: [audit]
+
+    - name: "[AUDIT] Check Security event log size"
+      win_shell: |
+        (Get-WinEvent -ListLog Security).MaximumSizeInBytes / 1MB
+      register: win_security_log_size
+      changed_when: false
+      failed_when: false
+      tags: [audit]
+
+    - name: "[AUDIT] Check PowerShell script block logging"
+      win_reg_stat:
+        path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging
+        name: EnableScriptBlockLogging
+      register: win_ps_logging
+      failed_when: false
+      tags: [audit]
+
+    - name: "[AUDIT] Check PowerShell module logging"
+      win_reg_stat:
+        path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging
+        name: EnableModuleLogging
+      register: win_ps_module_logging
+      failed_when: false
+      tags: [audit]
+
+    - name: "[AUDIT] Check Sysmon installed"
+      win_service:
+        name: Sysmon64
+      register: win_sysmon
+      failed_when: false
+      tags: [audit]
+
+    - name: "[AUDIT] Check command line auditing"
+      win_reg_stat:
+        path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit
+        name: ProcessCreationIncludeCmdLine_Enabled
+      register: win_cmdline_audit
+      failed_when: false
+      tags: [audit]
+
+    - name: "[AUDIT] Build findings"
+      set_fact:
+        audit_findings:
+          - check: "Security log size"
+            status: "{{ 'PASS' if (win_security_log_size.stdout | default('0') | trim | float) >= 200 else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "Security log: {{ win_security_log_size.stdout | default('unknown') | trim }} MB (expected >= 200 MB)"
+            fix: "wevtutil sl Security /ms:209715200"
+          - check: "PowerShell script block logging"
+            status: "{{ 'PASS' if (win_ps_logging.value | default(0) | int) == 1 else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "ScriptBlockLogging = {{ win_ps_logging.value | default('not set') }}"
+            fix: "Enable via GPO: Administrative Templates > Windows Components > PowerShell > Turn on Script Block Logging"
+          - check: "PowerShell module logging"
+            status: "{{ 'PASS' if (win_ps_module_logging.value | default(0) | int) == 1 else 'FAIL' }}"
+            severity: "MEDIUM"
+            detail: "ModuleLogging = {{ win_ps_module_logging.value | default('not set') }}"
+            fix: "Enable via GPO: Administrative Templates > Windows Components > PowerShell > Turn on Module Logging"
+          - check: "Sysmon installed"
+            status: "{{ 'PASS' if (win_sysmon.state | default('absent')) == 'running' else 'WARN' }}"
+            severity: "MEDIUM"
+            detail: "Sysmon64: {{ win_sysmon.state | default('not installed') }}"
+            fix: "Install Sysmon with SwiftOnSecurity config"
+          - check: "Command line process auditing"
+            status: "{{ 'PASS' if (win_cmdline_audit.value | default(0) | int) == 1 else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "ProcessCreationIncludeCmdLine = {{ win_cmdline_audit.value | default('not set') }}"
+            fix: "Enable via GPO: Administrative Templates > System > Audit Process Creation"
+      tags: [audit]
+
+    - name: "[AUDIT] Check audit subcategories"
+      win_shell: |
+        auditpol /get /subcategory:"{{ item.name }}" 2>$null | Select-String "{{ item.name }}"
+      register: audit_subcat_results
+      changed_when: false
+      failed_when: false
+      loop: "{{ audit_subcategories }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags: [audit]
+
+    - name: "[AUDIT] Build subcategory findings"
+      set_fact:
+        audit_subcat_findings: >-
+          {% set findings = [] %}
+          {% for result in audit_subcat_results.results | default([]) %}
+          {%   set output = result.stdout | default('') | trim %}
+          {%   set expected = result.item.expected %}
+          {%   set has_expected = expected in output %}
+          {%   set _ = findings.append({
+                 "check": "Audit: " + result.item.name,
+                 "status": "PASS" if has_expected else "FAIL",
+                 "severity": "MEDIUM",
+                 "detail": output if output | length > 0 else "Not configured",
+                 "fix": "auditpol /set /subcategory:\"" + result.item.name + "\" /success:enable /failure:enable"
+               }) %}
+          {% endfor %}
+          {{ findings }}
+      tags: [audit]
+
+    - name: "[AUDIT] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ audit_findings + (audit_subcat_findings | default([])) }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [audit]
+
+    # =========================================================================
+    # Network Hardening Checks
+    # =========================================================================
+    - name: "[NETWORK] Check SMB signing"
+      win_shell: |
+        (Get-SmbServerConfiguration).RequireSecuritySignature
+      register: win_smb_sign
+      changed_when: false
+      failed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Check LLMNR disabled"
+      win_reg_stat:
+        path: HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient
+        name: EnableMulticast
+      register: win_llmnr
+      failed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Check NetBIOS over TCP/IP"
+      win_shell: |
+        Get-WmiObject Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" | Select-Object Description, TcpipNetbiosOptions | ConvertTo-Json
+      register: win_netbios
+      changed_when: false
+      failed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Check WinRM HTTPS"
+      win_shell: |
+        Get-WSManInstance -ResourceURI winrm/config/Listener -Enumerate 2>$null | Where-Object { $_.Transport -eq "HTTPS" } | Measure-Object | Select-Object -ExpandProperty Count
+      register: win_winrm_https
+      changed_when: false
+      failed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Check IPv6 status"
+      win_shell: |
+        Get-NetAdapterBinding -ComponentId ms_tcpip6 | Select-Object Name, Enabled | ConvertTo-Json
+      register: win_ipv6
+      changed_when: false
+      failed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Build findings"
+      set_fact:
+        network_findings:
+          - check: "LLMNR disabled"
+            status: "{{ 'PASS' if (win_llmnr.value | default(1) | int) == 0 else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "EnableMulticast = {{ win_llmnr.value | default('not set (enabled by default)') }}"
+            fix: "Set via GPO: Computer Configuration > Administrative Templates > Network > DNS Client > Turn off Multicast Name Resolution"
+          - check: "SMB signing enforced"
+            status: "{{ 'PASS' if (win_smb_sign.stdout | default('') | trim | lower) == 'true' else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "RequireSecuritySignature = {{ win_smb_sign.stdout | default('unknown') | trim }}"
+            fix: "Set-SmbServerConfiguration -RequireSecuritySignature $true -Force"
+          - check: "WinRM HTTPS listener"
+            status: "{{ 'PASS' if (win_winrm_https.stdout | default('0') | trim | int) > 0 else 'WARN' }}"
+            severity: "MEDIUM"
+            detail: "HTTPS listeners: {{ win_winrm_https.stdout | default('0') | trim }}"
+            fix: "Configure WinRM HTTPS listener with a valid certificate"
+      tags: [network]
+
+    - name: "[NETWORK] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ network_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [network]
+
+    # =========================================================================
+    # Security Agent Checks
+    # =========================================================================
+    - name: "[AGENTS] Check Windows Defender status"
+      win_shell: |
+        Get-MpComputerStatus | Select-Object AntivirusEnabled, RealTimeProtectionEnabled, AntivirusSignatureLastUpdated | ConvertTo-Json
+      register: win_defender
+      changed_when: false
+      failed_when: false
+      tags: [agents]
+
+    - name: "[AGENTS] Check Wazuh agent service"
+      win_service:
+        name: wazuh
+      register: win_wazuh
+      failed_when: false
+      tags: [agents]
+
+    - name: "[AGENTS] Check Tailscale service"
+      win_service:
+        name: Tailscale
+      register: win_tailscale
+      failed_when: false
+      tags: [agents]
+
+    - name: "[AGENTS] Build findings"
+      set_fact:
+        agents_findings:
+          - check: "Windows Defender"
+            status: "{{ 'PASS' if (win_defender.stdout | default('')) is search('\"AntivirusEnabled\"\\s*:\\s*true') else 'FAIL' }}"
+            severity: "CRITICAL"
+            detail: "{{ win_defender.stdout | default('unable to check') | trim }}"
+            fix: "Enable Windows Defender via Settings > Virus & threat protection"
+          - check: "Defender real-time protection"
+            status: "{{ 'PASS' if (win_defender.stdout | default('')) is search('\"RealTimeProtectionEnabled\"\\s*:\\s*true') else 'FAIL' }}"
+            severity: "CRITICAL"
+            detail: "Real-time protection check"
+            fix: "Set-MpPreference -DisableRealtimeMonitoring $false"
+          - check: "Wazuh agent"
+            status: "{{ 'PASS' if (win_wazuh.state | default('absent')) == 'running' else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "Wazuh: {{ win_wazuh.state | default('not installed') }}"
+            fix: "Install and start Wazuh agent"
+          - check: "Tailscale"
+            status: "{{ 'PASS' if (win_tailscale.state | default('absent')) == 'running' else 'WARN' }}"
+            severity: "MEDIUM"
+            detail: "Tailscale: {{ win_tailscale.state | default('not installed') }}"
+            fix: "Install Tailscale"
+      tags: [agents]
+
+    - name: "[AGENTS] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ agents_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [agents]
+
+    # =========================================================================
+    # Aggregate all findings for report
+    # =========================================================================
+    - name: "[SUMMARY] Aggregate all findings"
+      set_fact:
+        all_findings: >-
+          {{
+            (rdp_findings | default([])) +
+            (firewall_findings | default([])) +
+            (services_findings | default([])) +
+            (filesystem_findings | default([])) +
+            (patches_findings | default([])) +
+            (auth_findings | default([])) +
+            (audit_findings | default([])) +
+            (audit_subcat_findings | default([])) +
+            (network_findings | default([])) +
+            (agents_findings | default([]))
+          }}
+      tags: [always]
+
+    - name: "[SUMMARY] Count results"
+      set_fact:
+        pass_count: "{{ all_findings | selectattr('status', 'equalto', 'PASS') | list | length }}"
+        fail_count: "{{ all_findings | selectattr('status', 'equalto', 'FAIL') | list | length }}"
+        warn_count: "{{ all_findings | selectattr('status', 'equalto', 'WARN') | list | length }}"
+        critical_count: "{{ all_findings | selectattr('severity', 'equalto', 'CRITICAL') | selectattr('status', 'equalto', 'FAIL') | list | length }}"
+        high_count: "{{ all_findings | selectattr('severity', 'equalto', 'HIGH') | selectattr('status', 'equalto', 'FAIL') | list | length }}"
+        medium_count: "{{ all_findings | selectattr('severity', 'equalto', 'MEDIUM') | selectattr('status', 'equalto', 'FAIL') | list | length }}"
+        low_count: "{{ all_findings | selectattr('severity', 'equalto', 'LOW') | selectattr('status', 'equalto', 'FAIL') | list | length }}"
+      tags: [always]
+
+    - name: "[SUMMARY] Display summary"
+      debug:
+        msg:
+          - "========================================="
+          - "  WINDOWS SECURITY AUDIT: {{ inventory_hostname }}"
+          - "========================================="
+          - "  PASS: {{ pass_count }} | FAIL: {{ fail_count }} | WARN: {{ warn_count }}"
+          - "  CRITICAL fails: {{ critical_count }}"
+          - "  HIGH fails:     {{ high_count }}"
+          - "  MEDIUM fails:   {{ medium_count }}"
+          - "  LOW fails:      {{ low_count }}"
+          - "========================================="
+      tags: [always]
+
+    - name: "[SUMMARY] List failed checks"
+      debug:
+        msg: "FAIL [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ all_findings | selectattr('status', 'equalto', 'FAIL') | list }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [always]
+
+# =============================================================================
+# Report Generation (runs on localhost)
+# =============================================================================
+- name: Generate Windows Security Audit Report
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  tags: [always]
+  vars:
+    report_date: "{{ ansible_date_time.date }}"
+    report_dir: "{{ lookup('env', 'HOME') }}/HiFi Solutions/hifi-security-audit/reports"
+    report_file: "{{ report_dir }}/security-audit-windows-{{ ansible_date_time.date }}.md"
+
+  tasks:
+    - name: "[REPORT] Create reports directory"
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: "[REPORT] Generate markdown report"
+      template:
+        src: templates/security-report-windows.md.j2
+        dest: "{{ report_file }}"
+        mode: "0644"
+
+    - name: "[REPORT] Report location"
+      debug:
+        msg: "Windows security audit report written to: {{ report_file }}"

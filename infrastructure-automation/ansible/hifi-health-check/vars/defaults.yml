@@ -1,0 +1,32 @@
+---
+# HiFi Health Check - Tunable Defaults
+#
+# Override per-client or pass at runtime:
+#   ansible-playbook -i inventory/<client>.ini health-check.yml -e @vars/defaults.yml
+
+# Disk usage warning threshold (percentage)
+disk_usage_warn: 85
+
+# CPU temperature warning (Celsius, Linux only)
+cpu_temp_warn: 75
+
+# ECC correctable error threshold before warning (Linux only)
+ecc_ce_warn: 100
+
+# SMART reallocated sector threshold (Linux only)
+smart_reallocated_warn: 50
+
+# SMART pending sector threshold (Linux only)
+smart_pending_warn: 1
+
+# Load average warning multiplier (warn if 15m load > cores * this)
+load_warn_multiplier: 2
+
+# Swap usage warning threshold (percentage, Linux only)
+swap_usage_warn: 50
+
+# Uptime warning threshold (days without reboot)
+uptime_warn_days: 180
+
+# Event log lookback window (hours, Windows only)
+event_log_hours: 24

@@ -1,0 +1,419 @@
+---
+# macOS Health Check Playbook
+# Read-only system health assessment for client environments
+# Connects via SSH (Remote Login must be enabled)
+#
+# Tags: overview, disk, smart, network, services, time, battery
+#
+# Usage:
+#   ansible-playbook -i inventory/<client>.ini health-check-macos.yml
+#   ansible-playbook -i inventory/<client>.ini health-check-macos.yml -l mac-1
+#   ansible-playbook -i inventory/<client>.ini health-check-macos.yml --tags disk,battery
+
+- name: macOS Health Check
+  hosts: macos
+  become: true
+  gather_facts: true
+  vars:
+    disk_usage_warn: 85
+    uptime_warn_days: 60
+
+  tasks:
+    # =========================================================================
+    # System Overview
+    # =========================================================================
+    - name: "[OVERVIEW] Get macOS version"
+      shell: sw_vers -productVersion
+      register: mac_version
+      changed_when: false
+      tags: [overview]
+
+    - name: "[OVERVIEW] Get hardware model"
+      shell: sysctl -n hw.model 2>/dev/null || echo "unknown"
+      register: mac_model
+      changed_when: false
+      tags: [overview]
+
+    - name: "[OVERVIEW] Get CPU info"
+      shell: sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "unknown"
+      register: mac_cpu
+      changed_when: false
+      tags: [overview]
+
+    - name: "[OVERVIEW] Get memory pressure"
+      shell: memory_pressure 2>/dev/null | grep "System-wide memory free percentage" | awk '{print $NF}' | tr -d '%' || echo "n/a"
+      register: mac_mem_pressure
+      changed_when: false
+      failed_when: false
+      tags: [overview]
+
+    - name: "[OVERVIEW] Build findings"
+      set_fact:
+        overview_findings:
+          - check: "Hostname"
+            status: "INFO"
+            severity: "LOW"
+            detail: "{{ ansible_hostname }}"
+            fix: "N/A"
+          - check: "macOS version"
+            status: "INFO"
+            severity: "LOW"
+            detail: "macOS {{ mac_version.stdout | default('unknown') }}"
+            fix: "N/A"
+          - check: "Hardware model"
+            status: "INFO"
+            severity: "LOW"
+            detail: "{{ mac_model.stdout | default('unknown') }}"
+            fix: "N/A"
+          - check: "CPU"
+            status: "INFO"
+            severity: "LOW"
+            detail: "{{ mac_cpu.stdout | default('unknown') }} | {{ ansible_processor_vcpus }} vCPUs"
+            fix: "N/A"
+          - check: "RAM"
+            status: "{{ 'WARN' if ((ansible_memtotal_mb - ansible_memfree_mb) * 100 / ansible_memtotal_mb) | round(0) | int > 90 else 'PASS' }}"
+            severity: "MEDIUM"
+            detail: "{{ (ansible_memtotal_mb / 1024) | round(1) }} GB total, {{ ((ansible_memtotal_mb - ansible_memfree_mb) * 100 / ansible_memtotal_mb) | round(1) }}% used"
+            fix: "Close unused applications; check Activity Monitor for memory hogs"
+          - check: "Uptime"
+            status: "{{ 'WARN' if (ansible_uptime_seconds | int // 86400) > uptime_warn_days else 'PASS' }}"
+            severity: "LOW"
+            detail: "{{ ansible_uptime_seconds | int // 86400 }}d {{ (ansible_uptime_seconds | int % 86400) // 3600 }}h"
+            fix: "Restart the Mac to apply pending updates"
+      tags: [overview]
+
+    - name: "[OVERVIEW] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ overview_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [overview]
+
+    # =========================================================================
+    # Disk Usage & Health
+    # =========================================================================
+    - name: "[DISK] Check volume usage"
+      shell: df -h / /System/Volumes/Data 2>/dev/null | tail -n +2
+      register: mac_disk
+      changed_when: false
+      tags: [disk]
+
+    - name: "[DISK] Get usage percentage"
+      shell: df / | awk 'NR==2 {gsub(/%/,"",$5); print $5}'
+      register: mac_disk_pct
+      changed_when: false
+      tags: [disk]
+
+    - name: "[DISK] Build findings"
+      set_fact:
+        disk_findings: >-
+          {% set pct = mac_disk_pct.stdout | default('0') | int %}
+          {{
+            [{
+              "check": "Root volume usage",
+              "status": "FAIL" if pct > 95 else ("WARN" if pct > disk_usage_warn else "PASS"),
+              "severity": "CRITICAL" if pct > 95 else ("HIGH" if pct > disk_usage_warn else "LOW"),
+              "detail": (pct | string) + "% used (threshold: " + (disk_usage_warn | string) + "%)",
+              "fix": "Clear caches, empty Trash, remove old downloads: sudo du -sh /Users/*/Library/Caches/*"
+            }]
+          }}
+      tags: [disk]
+
+    - name: "[DISK] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ disk_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [disk]
+
+    - name: "[DISK] Volume detail"
+      debug:
+        msg: "{{ mac_disk.stdout_lines }}"
+      tags: [disk]
+
+    # =========================================================================
+    # SMART (via diskutil)
+    # =========================================================================
+    - name: "[SMART] Check disk SMART status"
+      shell: |
+        diskutil info disk0 2>/dev/null | grep "SMART Status" | awk -F': ' '{print $2}' || echo "Not Supported"
+      register: mac_smart
+      changed_when: false
+      failed_when: false
+      tags: [smart]
+
+    - name: "[SMART] Build findings"
+      set_fact:
+        smart_findings:
+          - check: "Disk SMART status"
+            status: "{{ 'PASS' if (mac_smart.stdout | default('') | trim) == 'Verified' else ('FAIL' if (mac_smart.stdout | default('') | trim) == 'Failing' else 'INFO') }}"
+            severity: "{{ 'CRITICAL' if (mac_smart.stdout | default('') | trim) == 'Failing' else 'HIGH' }}"
+            detail: "SMART: {{ mac_smart.stdout | default('unknown') | trim }}"
+            fix: "Back up data immediately and replace the drive"
+      tags: [smart]
+
+    - name: "[SMART] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ smart_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [smart]
+
+    # =========================================================================
+    # Battery (laptops)
+    # =========================================================================
+    - name: "[BATTERY] Check battery health"
+      shell: |
+        ioreg -r -c AppleSmartBattery 2>/dev/null | grep -E "MaxCapacity|DesignCapacity|CycleCount|FullyCharged" | head -4 || echo "no_battery"
+      register: mac_battery_raw
+      changed_when: false
+      failed_when: false
+      tags: [battery]
+
+    - name: "[BATTERY] Get cycle count"
+      shell: |
+        system_profiler SPPowerDataType 2>/dev/null | grep "Cycle Count" | awk '{print $NF}' || echo "n/a"
+      register: mac_cycle_count
+      changed_when: false
+      failed_when: false
+      tags: [battery]
+
+    - name: "[BATTERY] Get condition"
+      shell: |
+        system_profiler SPPowerDataType 2>/dev/null | grep "Condition" | awk -F': ' '{print $2}' || echo "n/a"
+      register: mac_battery_condition
+      changed_when: false
+      failed_when: false
+      tags: [battery]
+
+    - name: "[BATTERY] Build findings"
+      set_fact:
+        battery_findings: >-
+          {% set findings = [] %}
+          {% if (mac_battery_raw.stdout | default('')) is search('no_battery') %}
+          {%   set _ = findings.append({
+                 "check": "Battery",
+                 "status": "SKIP",
+                 "severity": "LOW",
+                 "detail": "No battery detected (desktop)",
+                 "fix": "N/A"
+               }) %}
+          {% else %}
+          {%   set condition = mac_battery_condition.stdout | default('n/a') | trim %}
+          {%   set cycles = mac_cycle_count.stdout | default('n/a') | trim %}
+          {%   set _ = findings.append({
+                 "check": "Battery condition",
+                 "status": "PASS" if condition == 'Normal' else "WARN",
+                 "severity": "MEDIUM",
+                 "detail": "Condition: " + condition + " | Cycles: " + cycles,
+                 "fix": "Consider battery replacement if condition is not Normal"
+               }) %}
+          {% endif %}
+          {{ findings }}
+      tags: [battery]
+
+    - name: "[BATTERY] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ battery_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [battery]
+
+    # =========================================================================
+    # Network
+    # =========================================================================
+    - name: "[NETWORK] Check active interfaces"
+      shell: ifconfig -lu
+      register: mac_interfaces
+      changed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Check DNS resolution"
+      shell: host google.com >/dev/null 2>&1 && echo "OK" || echo "FAIL"
+      register: mac_dns
+      changed_when: false
+      failed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Check default gateway"
+      shell: route -n get default 2>/dev/null | grep gateway | awk '{print $2}' || echo "none"
+      register: mac_gateway
+      changed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Check Wi-Fi info"
+      shell: |
+        /System/Library/PrivateFrameworks/Apple80211.framework/Resources/airport -I 2>/dev/null | grep -E "SSID|RSSI|channel" | head -3 || echo "no wifi"
+      register: mac_wifi
+      changed_when: false
+      failed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Build findings"
+      set_fact:
+        network_findings:
+          - check: "DNS resolution"
+            status: "{{ 'PASS' if (mac_dns.stdout | default('') | trim) == 'OK' else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "DNS {{ mac_dns.stdout | default('unknown') | trim }}"
+            fix: "Check DNS settings in System Preferences > Network"
+          - check: "Default gateway"
+            status: "{{ 'PASS' if (mac_gateway.stdout | default('none') | trim) != 'none' else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "Gateway: {{ mac_gateway.stdout | default('none') | trim }}"
+            fix: "Check network configuration"
+      tags: [network]
+
+    - name: "[NETWORK] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ network_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [network]
+
+    # =========================================================================
+    # Services
+    # =========================================================================
+    - name: "[SERVICES] Check key launchd services"
+      shell: |
+        launchctl list com.apple.{{ item }} 2>/dev/null && echo "{{ item }}=running" || echo "{{ item }}=not-loaded"
+      register: mac_services
+      changed_when: false
+      failed_when: false
+      loop:
+        - auditd
+        - syslogd
+        - opendirectoryd
+      tags: [services]
+
+    - name: "[SERVICES] Build findings"
+      set_fact:
+        services_findings: >-
+          {% set findings = [] %}
+          {% for result in mac_services.results | default([]) %}
+          {%   set is_running = (result.stdout | default('')) is search('running') %}
+          {%   set _ = findings.append({
+                 "check": "Service: " + result.item,
+                 "status": "PASS" if is_running else "WARN",
+                 "severity": "MEDIUM",
+                 "detail": result.item + ": " + ("running" if is_running else "not loaded"),
+                 "fix": "Check launchctl list for service status"
+               }) %}
+          {% endfor %}
+          {{ findings }}
+      tags: [services]
+
+    - name: "[SERVICES] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ services_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [services]
+
+    # =========================================================================
+    # Time / NTP
+    # =========================================================================
+    - name: "[TIME] Check NTP"
+      shell: systemsetup -getusingnetworktime 2>/dev/null | awk '{print $NF}' || echo "unknown"
+      register: mac_ntp
+      changed_when: false
+      failed_when: false
+      tags: [time]
+
+    - name: "[TIME] Build findings"
+      set_fact:
+        time_findings:
+          - check: "Network time"
+            status: "{{ 'PASS' if (mac_ntp.stdout | default('') | trim | lower) == 'on' else 'FAIL' }}"
+            severity: "MEDIUM"
+            detail: "Network time: {{ mac_ntp.stdout | default('unknown') | trim }} | System time: {{ ansible_date_time.iso8601 }}"
+            fix: "sudo systemsetup -setusingnetworktime on"
+      tags: [time]
+
+    - name: "[TIME] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ time_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [time]
+
+    # =========================================================================
+    # Aggregate and Summary
+    # =========================================================================
+    - name: "[SUMMARY] Aggregate all findings"
+      set_fact:
+        all_findings: >-
+          {{
+            (overview_findings | default([])) +
+            (disk_findings | default([])) +
+            (smart_findings | default([])) +
+            (battery_findings | default([])) +
+            (network_findings | default([])) +
+            (services_findings | default([])) +
+            (time_findings | default([]))
+          }}
+      tags: [always]
+
+    - name: "[SUMMARY] Count results"
+      set_fact:
+        pass_count: "{{ all_findings | selectattr('status', 'equalto', 'PASS') | list | length }}"
+        fail_count: "{{ all_findings | selectattr('status', 'equalto', 'FAIL') | list | length }}"
+        warn_count: "{{ all_findings | selectattr('status', 'equalto', 'WARN') | list | length }}"
+        critical_count: "{{ all_findings | selectattr('severity', 'equalto', 'CRITICAL') | selectattr('status', 'in', ['FAIL', 'WARN']) | list | length }}"
+      tags: [always]
+
+    - name: "[SUMMARY] Display summary"
+      debug:
+        msg:
+          - "========================================="
+          - "  macOS HEALTH CHECK: {{ inventory_hostname }}"
+          - "========================================="
+          - "  PASS: {{ pass_count }} | FAIL: {{ fail_count }} | WARN: {{ warn_count }}"
+          - "  CRITICAL issues: {{ critical_count }}"
+          - "========================================="
+      tags: [always]
+
+    - name: "[SUMMARY] List issues"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ all_findings | selectattr('status', 'in', ['FAIL', 'WARN']) | list }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [always]
+
+# =============================================================================
+# Report Generation
+# =============================================================================
+- name: Generate macOS Health Check Report
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  tags: [always]
+  vars:
+    report_date: "{{ ansible_date_time.date }}"
+    report_dir: "{{ lookup('env', 'HOME') }}/HiFi Solutions/Ansible/hifi-health-check/reports"
+    report_file: "{{ report_dir }}/health-check-macos-{{ ansible_date_time.date }}.md"
+
+  tasks:
+    - name: "[REPORT] Create reports directory"
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: "[REPORT] Generate markdown report"
+      template:
+        src: templates/health-report-macos.md.j2
+        dest: "{{ report_file }}"
+        mode: "0644"
+
+    - name: "[REPORT] Report location"
+      debug:
+        msg: "macOS health check report written to: {{ report_file }}"

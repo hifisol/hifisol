@@ -1,0 +1,474 @@
+---
+# Windows Health Check Playbook
+# Read-only system health assessment for client environments
+# Requires WinRM connectivity (pywinrm on control node)
+#
+# Tags: overview, disk, memory, network, services, time, eventlog
+#
+# Usage:
+#   ansible-playbook -i inventory/<client>.ini health-check-windows.yml
+#   ansible-playbook -i inventory/<client>.ini health-check-windows.yml -l win-1
+#   ansible-playbook -i inventory/<client>.ini health-check-windows.yml --tags disk,services
+
+- name: Windows Health Check
+  hosts: windows
+  gather_facts: true
+  vars:
+    disk_usage_warn: 85
+    uptime_warn_days: 90
+    event_log_hours: 24
+
+  tasks:
+    # =========================================================================
+    # System Overview
+    # =========================================================================
+    - name: "[OVERVIEW] Get system info"
+      win_shell: |
+        $os = Get-CimInstance Win32_OperatingSystem
+        $cs = Get-CimInstance Win32_ComputerSystem
+        $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+        $uptime = (Get-Date) - $os.LastBootUpTime
+        @{
+          Hostname = $env:COMPUTERNAME
+          OS = $os.Caption
+          Build = $os.BuildNumber
+          Version = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").DisplayVersion
+          Uptime = "$($uptime.Days)d $($uptime.Hours)h"
+          UptimeDays = $uptime.Days
+          CPUs = $cs.NumberOfLogicalProcessors
+          RAM_GB = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
+          RAM_Used_Pct = [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / $os.TotalVisibleMemorySize * 100, 1)
+          CPU_Name = $cpu.Name
+          CPU_Load = $cpu.LoadPercentage
+        } | ConvertTo-Json
+      register: win_overview
+      changed_when: false
+      tags: [overview]
+
+    - name: "[OVERVIEW] Parse system info"
+      set_fact:
+        sys_info: "{{ win_overview.stdout | from_json }}"
+      tags: [overview]
+
+    - name: "[OVERVIEW] Build findings"
+      set_fact:
+        overview_findings:
+          - check: "Hostname"
+            status: "INFO"
+            severity: "LOW"
+            detail: "{{ sys_info.Hostname | default('unknown') }}"
+            fix: "N/A"
+          - check: "Operating System"
+            status: "INFO"
+            severity: "LOW"
+            detail: "{{ sys_info.OS | default('unknown') }} {{ sys_info.Version | default('') }} (Build {{ sys_info.Build | default('') }})"
+            fix: "N/A"
+          - check: "Uptime"
+            status: "{{ 'WARN' if (sys_info.UptimeDays | default(0) | int) > uptime_warn_days else 'PASS' }}"
+            severity: "LOW"
+            detail: "{{ sys_info.Uptime | default('unknown') }}"
+            fix: "Schedule a maintenance reboot"
+          - check: "CPU"
+            status: "{{ 'WARN' if (sys_info.CPU_Load | default(0) | int) > 90 else 'PASS' }}"
+            severity: "MEDIUM"
+            detail: "{{ sys_info.CPU_Name | default('unknown') }} | {{ sys_info.CPUs | default(0) }} logical CPUs | {{ sys_info.CPU_Load | default(0) }}% load"
+            fix: "Investigate high CPU: Task Manager > Details, sorted by CPU"
+          - check: "RAM"
+            status: "{{ 'WARN' if (sys_info.RAM_Used_Pct | default(0) | float) > 90 else 'PASS' }}"
+            severity: "MEDIUM"
+            detail: "{{ sys_info.RAM_GB | default(0) }} GB total, {{ sys_info.RAM_Used_Pct | default(0) }}% used"
+            fix: "Investigate memory usage; consider adding RAM"
+      tags: [overview]
+
+    - name: "[OVERVIEW] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ overview_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [overview]
+
+    # =========================================================================
+    # Disk Health
+    # =========================================================================
+    - name: "[DISK] Check volume usage"
+      win_shell: |
+        Get-Volume | Where-Object { $_.DriveLetter -and $_.Size -gt 0 } | ForEach-Object {
+          $pct = [math]::Round(($_.Size - $_.SizeRemaining) / $_.Size * 100, 1)
+          "$($_.DriveLetter):|$pct|$([math]::Round($_.Size / 1GB, 1))|$([math]::Round($_.SizeRemaining / 1GB, 1))|$($_.HealthStatus)"
+        }
+      register: win_disk
+      changed_when: false
+      tags: [disk]
+
+    - name: "[DISK] Check physical disk health"
+      win_shell: |
+        Get-PhysicalDisk | ForEach-Object {
+          "$($_.FriendlyName)|$($_.MediaType)|$($_.Size / 1GB -as [int])GB|$($_.HealthStatus)|$($_.OperationalStatus)"
+        }
+      register: win_phys_disk
+      changed_when: false
+      failed_when: false
+      tags: [disk]
+
+    - name: "[DISK] Build findings"
+      set_fact:
+        disk_findings: >-
+          {% set findings = [] %}
+          {% for line in win_disk.stdout_lines | default([]) %}
+          {%   set parts = line.split('|') %}
+          {%   if parts | length >= 5 %}
+          {%     set drive = parts[0] %}
+          {%     set pct = parts[1] | float %}
+          {%     set total = parts[2] %}
+          {%     set free = parts[3] %}
+          {%     set health = parts[4] %}
+          {%     set _ = findings.append({
+                   "check": "Volume " + drive,
+                   "status": "FAIL" if pct > 95 else ("WARN" if pct > disk_usage_warn else "PASS"),
+                   "severity": "CRITICAL" if pct > 95 else ("HIGH" if pct > disk_usage_warn else "LOW"),
+                   "detail": drive + " " + (pct | string) + "% used (" + free + " GB free / " + total + " GB) Health: " + health,
+                   "fix": "Investigate disk usage; clean temp files, logs, old backups"
+                 }) %}
+          {%   endif %}
+          {% endfor %}
+          {% for line in win_phys_disk.stdout_lines | default([]) %}
+          {%   set parts = line.split('|') %}
+          {%   if parts | length >= 5 %}
+          {%     set name = parts[0] %}
+          {%     set health = parts[3] %}
+          {%     set _ = findings.append({
+                   "check": "Physical disk: " + name,
+                   "status": "PASS" if health == 'Healthy' else "FAIL",
+                   "severity": "CRITICAL",
+                   "detail": name + " (" + parts[1] + ", " + parts[2] + ") — " + health + " / " + parts[4],
+                   "fix": "Replace failing drive immediately"
+                 }) %}
+          {%   endif %}
+          {% endfor %}
+          {{ findings }}
+      tags: [disk]
+
+    - name: "[DISK] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ disk_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [disk]
+
+    # =========================================================================
+    # Memory
+    # =========================================================================
+    - name: "[MEMORY] Check pagefile usage"
+      win_shell: |
+        $pf = Get-CimInstance Win32_PageFileUsage
+        if ($pf) {
+          $pct = [math]::Round($pf.CurrentUsage / $pf.AllocatedBaseSize * 100, 1)
+          "$pct|$($pf.AllocatedBaseSize)|$($pf.CurrentUsage)"
+        } else { "0|0|0" }
+      register: win_pagefile
+      changed_when: false
+      failed_when: false
+      tags: [memory]
+
+    - name: "[MEMORY] Build findings"
+      set_fact:
+        memory_findings: >-
+          {% set parts = (win_pagefile.stdout | default('0|0|0') | trim).split('|') %}
+          {% set pct = parts[0] | default('0') | float %}
+          {{
+            [{
+              "check": "Pagefile usage",
+              "status": "WARN" if pct > 80 else "PASS",
+              "severity": "MEDIUM",
+              "detail": (pct | string) + "% pagefile used (" + (parts[2] | default('0')) + " / " + (parts[1] | default('0')) + " MB)",
+              "fix": "Investigate memory pressure; consider adding RAM"
+            }]
+          }}
+      tags: [memory]
+
+    - name: "[MEMORY] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ memory_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [memory]
+
+    # =========================================================================
+    # Network
+    # =========================================================================
+    - name: "[NETWORK] Check adapters"
+      win_shell: |
+        Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
+          "$($_.Name)|$($_.Status)|$($_.LinkSpeed)|$($_.MacAddress)"
+        }
+      register: win_adapters
+      changed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Check DNS resolution"
+      win_shell: |
+        try { Resolve-DnsName google.com -ErrorAction Stop | Out-Null; "OK" } catch { "FAIL" }
+      register: win_dns
+      changed_when: false
+      failed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Check default gateway"
+      win_shell: |
+        (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1).NextHop
+      register: win_gateway
+      changed_when: false
+      failed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Build findings"
+      set_fact:
+        network_findings:
+          - check: "DNS resolution"
+            status: "{{ 'PASS' if (win_dns.stdout | default('') | trim) == 'OK' else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "DNS {{ win_dns.stdout | default('unknown') | trim }}"
+            fix: "Check DNS server configuration in network adapter settings"
+          - check: "Default gateway"
+            status: "{{ 'PASS' if (win_gateway.stdout | default('') | trim | length) > 0 else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "Gateway: {{ win_gateway.stdout | default('none') | trim }}"
+            fix: "Check network configuration"
+      tags: [network]
+
+    - name: "[NETWORK] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ network_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [network]
+
+    - name: "[NETWORK] Adapter listing"
+      debug:
+        msg: "{{ win_adapters.stdout_lines | default([]) }}"
+      tags: [network]
+
+    # =========================================================================
+    # Services
+    # =========================================================================
+    - name: "[SERVICES] Check auto-start services that are stopped"
+      win_shell: |
+        Get-Service | Where-Object { $_.StartType -eq 'Automatic' -and $_.Status -ne 'Running' } |
+          ForEach-Object { "$($_.Name)|$($_.DisplayName)|$($_.Status)" }
+      register: win_stopped_auto
+      changed_when: false
+      tags: [services]
+
+    - name: "[SERVICES] Build findings"
+      set_fact:
+        services_findings: >-
+          {% set findings = [] %}
+          {% set stopped = win_stopped_auto.stdout_lines | default([]) %}
+          {% if stopped | length > 0 %}
+          {%   for line in stopped %}
+          {%     set parts = line.split('|') %}
+          {%     if parts | length >= 3 %}
+          {%       set _ = findings.append({
+                     "check": "Stopped auto-start: " + parts[0],
+                     "status": "WARN",
+                     "severity": "MEDIUM",
+                     "detail": parts[1] + " (" + parts[0] + ") is " + parts[2] + " but set to Automatic",
+                     "fix": "Start-Service " + parts[0] + " or change to Manual if not needed"
+                   }) %}
+          {%     endif %}
+          {%   endfor %}
+          {% else %}
+          {%   set _ = findings.append({
+                 "check": "Auto-start services",
+                 "status": "PASS",
+                 "severity": "MEDIUM",
+                 "detail": "All auto-start services are running",
+                 "fix": "N/A"
+               }) %}
+          {% endif %}
+          {{ findings }}
+      tags: [services]
+
+    - name: "[SERVICES] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ services_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [services]
+
+    # =========================================================================
+    # Time / NTP
+    # =========================================================================
+    - name: "[TIME] Check time synchronization"
+      win_shell: |
+        $w32tm = w32tm /query /status 2>&1
+        if ($LASTEXITCODE -eq 0) {
+          $source = ($w32tm | Select-String "Source:").ToString().Split(":")[1].Trim()
+          $stratum = ($w32tm | Select-String "Stratum:").ToString().Split(":")[1].Trim()
+          "OK|$source|$stratum"
+        } else { "FAIL|none|none" }
+      register: win_time
+      changed_when: false
+      failed_when: false
+      tags: [time]
+
+    - name: "[TIME] Build findings"
+      set_fact:
+        time_findings: >-
+          {% set parts = (win_time.stdout | default('FAIL|none|none') | trim).split('|') %}
+          {{
+            [{
+              "check": "Time synchronization",
+              "status": "PASS" if parts[0] == 'OK' else "FAIL",
+              "severity": "MEDIUM",
+              "detail": "Source: " + (parts[1] | default('none')) + " | Stratum: " + (parts[2] | default('none')),
+              "fix": "w32tm /resync; check Windows Time service"
+            }]
+          }}
+      tags: [time]
+
+    - name: "[TIME] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ time_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [time]
+
+    # =========================================================================
+    # Event Log Errors
+    # =========================================================================
+    - name: "[EVENTLOG] Check critical/error events (last 24h)"
+      win_shell: |
+        $cutoff = (Get-Date).AddHours(-{{ event_log_hours }})
+        $sys = Get-WinEvent -FilterHashtable @{LogName='System'; Level=1,2; StartTime=$cutoff} -MaxEvents 10 -ErrorAction SilentlyContinue
+        $app = Get-WinEvent -FilterHashtable @{LogName='Application'; Level=1,2; StartTime=$cutoff} -MaxEvents 10 -ErrorAction SilentlyContinue
+        $sysCount = ($sys | Measure-Object).Count
+        $appCount = ($app | Measure-Object).Count
+        "System=$sysCount|Application=$appCount"
+        $sys | ForEach-Object { "SYS: [$($_.Id)] $($_.Message.Substring(0, [math]::Min(120, $_.Message.Length)))" }
+        $app | ForEach-Object { "APP: [$($_.Id)] $($_.Message.Substring(0, [math]::Min(120, $_.Message.Length)))" }
+      register: win_events
+      changed_when: false
+      failed_when: false
+      tags: [eventlog]
+
+    - name: "[EVENTLOG] Build findings"
+      set_fact:
+        eventlog_findings: >-
+          {% set header = (win_events.stdout_lines | default(['System=0|Application=0']) | first) %}
+          {% set parts = header.split('|') %}
+          {% set sys_count = (parts[0] | default('System=0')).split('=')[1] | default('0') | int %}
+          {% set app_count = (parts[1] | default('Application=0')).split('=')[1] | default('0') | int %}
+          {{
+            [
+              {
+                "check": "System event log errors (24h)",
+                "status": "WARN" if sys_count > 0 else "PASS",
+                "severity": "MEDIUM",
+                "detail": (sys_count | string) + " critical/error events",
+                "fix": "Review Event Viewer > Windows Logs > System"
+              },
+              {
+                "check": "Application event log errors (24h)",
+                "status": "WARN" if app_count > 0 else "PASS",
+                "severity": "MEDIUM",
+                "detail": (app_count | string) + " critical/error events",
+                "fix": "Review Event Viewer > Windows Logs > Application"
+              }
+            ]
+          }}
+      tags: [eventlog]
+
+    - name: "[EVENTLOG] Display findings"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ eventlog_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [eventlog]
+
+    - name: "[EVENTLOG] Event detail"
+      debug:
+        msg: "{{ win_events.stdout_lines[1:] | default([]) }}"
+      when: (win_events.stdout_lines | default([]) | length) > 1
+      tags: [eventlog]
+
+    # =========================================================================
+    # Aggregate and Summary
+    # =========================================================================
+    - name: "[SUMMARY] Aggregate all findings"
+      set_fact:
+        all_findings: >-
+          {{
+            (overview_findings | default([])) +
+            (disk_findings | default([])) +
+            (memory_findings | default([])) +
+            (network_findings | default([])) +
+            (services_findings | default([])) +
+            (time_findings | default([])) +
+            (eventlog_findings | default([]))
+          }}
+      tags: [always]
+
+    - name: "[SUMMARY] Count results"
+      set_fact:
+        pass_count: "{{ all_findings | selectattr('status', 'equalto', 'PASS') | list | length }}"
+        fail_count: "{{ all_findings | selectattr('status', 'equalto', 'FAIL') | list | length }}"
+        warn_count: "{{ all_findings | selectattr('status', 'equalto', 'WARN') | list | length }}"
+        critical_count: "{{ all_findings | selectattr('severity', 'equalto', 'CRITICAL') | selectattr('status', 'in', ['FAIL', 'WARN']) | list | length }}"
+      tags: [always]
+
+    - name: "[SUMMARY] Display summary"
+      debug:
+        msg:
+          - "========================================="
+          - "  WINDOWS HEALTH CHECK: {{ inventory_hostname }}"
+          - "========================================="
+          - "  PASS: {{ pass_count }} | FAIL: {{ fail_count }} | WARN: {{ warn_count }}"
+          - "  CRITICAL issues: {{ critical_count }}"
+          - "========================================="
+      tags: [always]
+
+    - name: "[SUMMARY] List issues"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ all_findings | selectattr('status', 'in', ['FAIL', 'WARN']) | list }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [always]
+
+# =============================================================================
+# Report Generation
+# =============================================================================
+- name: Generate Windows Health Check Report
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  tags: [always]
+  vars:
+    report_date: "{{ ansible_date_time.date }}"
+    report_dir: "{{ lookup('env', 'HOME') }}/HiFi Solutions/Ansible/hifi-health-check/reports"
+    report_file: "{{ report_dir }}/health-check-windows-{{ ansible_date_time.date }}.md"
+
+  tasks:
+    - name: "[REPORT] Create reports directory"
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: "[REPORT] Generate markdown report"
+      template:
+        src: templates/health-report-windows.md.j2
+        dest: "{{ report_file }}"
+        mode: "0644"
+
+    - name: "[REPORT] Report location"
+      debug:
+        msg: "Windows health check report written to: {{ report_file }}"

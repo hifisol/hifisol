@@ -1,0 +1,9 @@
+# Generated reports (may contain client data)
+reports/*.md
+
+# Client inventories (contain IPs and credentials)
+inventory/*.ini
+!inventory/example.ini
+
+# Ansible retry files
+*.retry

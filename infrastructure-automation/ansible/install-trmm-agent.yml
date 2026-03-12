@@ -1,0 +1,184 @@
+---
+# =============================================================================
+# Install Tactical RMM Agent
+# =============================================================================
+# Deploys the Tactical RMM agent on Linux hosts, with architecture detection
+# for AMD64 and ARM64 platforms.
+#
+# Prerequisites:
+#   - your-trmm-server must be deployed and running
+#   - Generate agent installer URLs from the TRMM web UI:
+#     Agents → Install Agent → select client/site/OS → copy the URL
+#   - Set trmm_agent_url in vars or pass via --extra-vars
+#
+# Usage:
+#   ansible-playbook playbooks/install-trmm-agent.yml                          # All hosts
+#   ansible-playbook playbooks/install-trmm-agent.yml --limit web-server-1     # Single host
+#   ansible-playbook playbooks/install-trmm-agent.yml --tags verify            # Check status only
+#   ansible-playbook playbooks/install-trmm-agent.yml -e "trmm_api_domain=rmm.example.com"
+# =============================================================================
+
+- name: Install Tactical RMM Agent on Linux Hosts
+  hosts: all
+  become: yes
+  vars:
+    # Tactical RMM Configuration
+    # Update these after deploying your-trmm-server
+    trmm_api_domain: "api.yourdomain.com"          # Your TRMM API subdomain
+    trmm_mesh_domain: "mesh.yourdomain.com"         # Your MeshCentral subdomain
+    trmm_agent_type: "server"                       # server or workstation
+    trmm_client_id: "1"                             # TRMM client ID (from web UI)
+    trmm_site_id: "1"                               # TRMM site ID (from web UI)
+    trmm_auth_token: ""                              # Agent install token (from web UI)
+
+    # Agent binary paths
+    trmm_agent_binary: "/usr/local/bin/tacticalagent"
+    trmm_mesh_binary: "/opt/tacticalmesh/meshagent"
+
+    # Control flag
+    install_trmm: yes
+
+  tasks:
+    # --- SECTION 1: SYSTEM PREP ---
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      tags: [prep, trmm]
+
+    - name: Install required dependencies
+      ansible.builtin.apt:
+        name:
+          - curl
+          - wget
+          - ca-certificates
+          - gnupg
+        state: present
+      tags: [prep, trmm]
+
+    # --- SECTION 2: PRE-FLIGHT CHECKS ---
+    - name: Check if TRMM agent already installed
+      ansible.builtin.stat:
+        path: "{{ trmm_agent_binary }}"
+      register: trmm_agent_exists
+      when: install_trmm
+      tags: [trmm]
+
+    - name: Check if MeshAgent already installed
+      ansible.builtin.stat:
+        path: "{{ trmm_mesh_binary }}"
+      register: trmm_mesh_exists
+      when: install_trmm
+      tags: [trmm]
+
+    - name: Check if TRMM agent service exists
+      ansible.builtin.systemd:
+        name: tacticalagent
+      register: trmm_service_check
+      failed_when: false
+      when: install_trmm
+      tags: [trmm]
+
+    - name: Skip if already installed
+      ansible.builtin.debug:
+        msg: "TRMM agent already installed on {{ inventory_hostname }} — skipping"
+      when:
+        - install_trmm
+        - trmm_agent_exists.stat.exists
+      tags: [trmm]
+
+    # --- SECTION 3: DOWNLOAD AND INSTALL AGENT ---
+    - name: Download TRMM agent installer (AMD64)
+      ansible.builtin.get_url:
+        url: "https://{{ trmm_api_domain }}/agents/linux/?client={{ trmm_client_id }}&site={{ trmm_site_id }}&agenttype={{ trmm_agent_type }}&arch=amd64&token={{ trmm_auth_token }}"
+        dest: /tmp/rmmagent-install.sh
+        mode: '0755'
+      when:
+        - install_trmm
+        - not trmm_agent_exists.stat.exists
+        - ansible_architecture == "x86_64"
+      tags: [trmm]
+
+    - name: Download TRMM agent installer (ARM64)
+      ansible.builtin.get_url:
+        url: "https://{{ trmm_api_domain }}/agents/linux/?client={{ trmm_client_id }}&site={{ trmm_site_id }}&agenttype={{ trmm_agent_type }}&arch=arm64&token={{ trmm_auth_token }}"
+        dest: /tmp/rmmagent-install.sh
+        mode: '0755'
+      when:
+        - install_trmm
+        - not trmm_agent_exists.stat.exists
+        - ansible_architecture == "aarch64"
+      tags: [trmm]
+
+    - name: Run TRMM agent installer
+      ansible.builtin.shell: /tmp/rmmagent-install.sh
+      args:
+        creates: "{{ trmm_agent_binary }}"
+      register: trmm_install_result
+      when:
+        - install_trmm
+        - not trmm_agent_exists.stat.exists
+      tags: [trmm]
+
+    - name: Display installer output
+      ansible.builtin.debug:
+        var: trmm_install_result.stdout_lines
+      when:
+        - install_trmm
+        - trmm_install_result.stdout_lines is defined
+      tags: [trmm]
+
+    - name: Clean up installer script
+      ansible.builtin.file:
+        path: /tmp/rmmagent-install.sh
+        state: absent
+      tags: [trmm]
+
+    # --- SECTION 4: SERVICE VERIFICATION ---
+    - name: Ensure TRMM agent service is enabled and running
+      ansible.builtin.service:
+        name: tacticalagent
+        state: started
+        enabled: yes
+      when: install_trmm
+      failed_when: false
+      tags: [trmm, verify]
+
+    - name: Check TRMM agent service status
+      ansible.builtin.command: systemctl status tacticalagent
+      register: trmm_agent_status
+      changed_when: false
+      failed_when: false
+      when: install_trmm
+      tags: [trmm, verify]
+
+    - name: Check MeshAgent service status
+      ansible.builtin.command: systemctl status meshagent
+      register: trmm_mesh_status
+      changed_when: false
+      failed_when: false
+      when: install_trmm
+      tags: [trmm, verify]
+
+    # --- SECTION 5: INSTALLATION SUMMARY ---
+    - name: Display installation summary
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "Tactical RMM Agent Installation"
+          - "Host: {{ inventory_hostname }}"
+          - "Arch: {{ ansible_architecture }}"
+          - "=========================================="
+          - "TRMM Agent:"
+          - "  Binary: {{ trmm_agent_binary }}"
+          - "  Installed: {{ trmm_agent_exists.stat.exists | default('unknown') }}"
+          - "  Service: {{ trmm_agent_status.stdout_lines[2] | default('not checked') }}"
+          - "MeshAgent:"
+          - "  Binary: {{ trmm_mesh_binary }}"
+          - "  Installed: {{ trmm_mesh_exists.stat.exists | default('unknown') }}"
+          - "  Service: {{ trmm_mesh_status.stdout_lines[2] | default('not checked') }}"
+          - ""
+          - "API: {{ trmm_api_domain }}"
+          - "Mesh: {{ trmm_mesh_domain }}"
+          - "=========================================="
+      tags: [verify]

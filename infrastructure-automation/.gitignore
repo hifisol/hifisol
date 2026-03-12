@@ -1,0 +1,20 @@
+# Generated reports (may contain client-sensitive data)
+**/reports/*.md
+
+# Client inventories (contain IPs and credentials)
+**/inventory/*.ini
+!**/inventory/example.ini
+
+# Ansible retry files
+*.retry
+
+# Windows Zone.Identifier files
+*Zone.Identifier
+
+# Vault files
+*vault*.yml
+!*vault*.yml.example
+
+# OS files
+.DS_Store
+Thumbs.db

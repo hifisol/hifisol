@@ -1,0 +1,766 @@
+---
+# macOS Security Baseline Assessment Playbook
+# Read-only audit — no changes are made to hosts
+# Connects via SSH (Remote Login must be enabled on targets)
+#
+# Tags: ssh, firewall, services, filesystem, patches, auth, audit, network, agents, encryption
+#
+# Usage:
+#   ansible-playbook -i inventory/<client>.ini security-audit-macos.yml
+#   ansible-playbook -i inventory/<client>.ini security-audit-macos.yml -l mac-1
+#   ansible-playbook -i inventory/<client>.ini security-audit-macos.yml --tags ssh,patches
+
+- name: macOS Security Baseline Assessment
+  hosts: macos
+  become: true
+  gather_facts: true
+  vars:
+    # Approved SSH cryptographic settings
+    approved_ciphers: "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr"
+    approved_macs: "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256"
+
+  tasks:
+    # =========================================================================
+    # SSH Hardening Checks
+    # =========================================================================
+    - name: "[SSH] Check PermitRootLogin"
+      shell: grep -i "^PermitRootLogin" /etc/ssh/sshd_config | awk '{print $2}'
+      register: ssh_permit_root
+      changed_when: false
+      failed_when: false
+      tags: [ssh]
+
+    - name: "[SSH] Check PasswordAuthentication"
+      shell: grep -i "^PasswordAuthentication" /etc/ssh/sshd_config | awk '{print $2}'
+      register: ssh_password_auth
+      changed_when: false
+      failed_when: false
+      tags: [ssh]
+
+    - name: "[SSH] Check PermitEmptyPasswords"
+      shell: grep -i "^PermitEmptyPasswords" /etc/ssh/sshd_config | awk '{print $2}'
+      register: ssh_empty_passwords
+      changed_when: false
+      failed_when: false
+      tags: [ssh]
+
+    - name: "[SSH] Check Remote Login status"
+      shell: systemsetup -getremotelogin 2>/dev/null | awk '{print $NF}'
+      register: mac_remote_login
+      changed_when: false
+      failed_when: false
+      tags: [ssh]
+
+    - name: "[SSH] Check sshd_config permissions"
+      stat:
+        path: /etc/ssh/sshd_config
+      register: sshd_config_stat
+      failed_when: false
+      tags: [ssh]
+
+    - name: "[SSH] Build findings"
+      set_fact:
+        ssh_findings:
+          - check: "PermitRootLogin"
+            status: "{{ 'PASS' if (ssh_permit_root.stdout | default('') | lower) == 'no' else 'FAIL' }}"
+            severity: "CRITICAL"
+            detail: "Value: {{ ssh_permit_root.stdout | default('not set') }}"
+            fix: "Set PermitRootLogin no in /etc/ssh/sshd_config"
+          - check: "PasswordAuthentication"
+            status: "{{ 'PASS' if (ssh_password_auth.stdout | default('') | lower) == 'no' else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "Value: {{ ssh_password_auth.stdout | default('not set') }}"
+            fix: "Set PasswordAuthentication no in /etc/ssh/sshd_config"
+          - check: "PermitEmptyPasswords"
+            status: "{{ 'PASS' if (ssh_empty_passwords.stdout | default('') | lower) == 'no' else 'FAIL' }}"
+            severity: "CRITICAL"
+            detail: "Value: {{ ssh_empty_passwords.stdout | default('not set') }}"
+            fix: "Set PermitEmptyPasswords no in /etc/ssh/sshd_config"
+          - check: "sshd_config permissions"
+            status: "{{ 'PASS' if (sshd_config_stat.stat.mode | default('')) == '0600' else 'FAIL' }}"
+            severity: "MEDIUM"
+            detail: "Mode: {{ sshd_config_stat.stat.mode | default('unknown') }}"
+            fix: "chmod 600 /etc/ssh/sshd_config"
+      tags: [ssh]
+
+    - name: "[SSH] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ ssh_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [ssh]
+
+    # =========================================================================
+    # Encryption Checks (FileVault)
+    # =========================================================================
+    - name: "[ENCRYPTION] Check FileVault status"
+      shell: fdesetup status 2>/dev/null
+      register: filevault_status
+      changed_when: false
+      failed_when: false
+      tags: [encryption]
+
+    - name: "[ENCRYPTION] Check FileVault users"
+      shell: fdesetup list 2>/dev/null
+      register: filevault_users
+      changed_when: false
+      failed_when: false
+      tags: [encryption]
+
+    - name: "[ENCRYPTION] Build findings"
+      set_fact:
+        encryption_findings:
+          - check: "FileVault enabled"
+            status: "{{ 'PASS' if (filevault_status.stdout | default('')) is search('FileVault is On') else 'FAIL' }}"
+            severity: "CRITICAL"
+            detail: "{{ filevault_status.stdout | default('unable to check') }}"
+            fix: "sudo fdesetup enable"
+      tags: [encryption]
+
+    - name: "[ENCRYPTION] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ encryption_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [encryption]
+
+    # =========================================================================
+    # Firewall Checks
+    # =========================================================================
+    - name: "[FIREWALL] Check Application Firewall status"
+      shell: /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null
+      register: mac_fw_status
+      changed_when: false
+      failed_when: false
+      tags: [firewall]
+
+    - name: "[FIREWALL] Check stealth mode"
+      shell: /usr/libexec/ApplicationFirewall/socketfilterfw --getstealthmode 2>/dev/null
+      register: mac_fw_stealth
+      changed_when: false
+      failed_when: false
+      tags: [firewall]
+
+    - name: "[FIREWALL] Check block all incoming"
+      shell: /usr/libexec/ApplicationFirewall/socketfilterfw --getblockall 2>/dev/null
+      register: mac_fw_blockall
+      changed_when: false
+      failed_when: false
+      tags: [firewall]
+
+    - name: "[FIREWALL] Check signed apps auto-allow"
+      shell: /usr/libexec/ApplicationFirewall/socketfilterfw --getallowsigned 2>/dev/null
+      register: mac_fw_signed
+      changed_when: false
+      failed_when: false
+      tags: [firewall]
+
+    - name: "[FIREWALL] List listening ports"
+      shell: lsof -i -P -n | grep LISTEN | awk '{print $1, $9}' | sort -u
+      register: mac_open_ports
+      changed_when: false
+      failed_when: false
+      tags: [firewall]
+
+    - name: "[FIREWALL] Build findings"
+      set_fact:
+        firewall_findings:
+          - check: "Application Firewall enabled"
+            status: "{{ 'PASS' if (mac_fw_status.stdout | default('')) is search('enabled') else 'FAIL' }}"
+            severity: "CRITICAL"
+            detail: "{{ mac_fw_status.stdout | default('unable to check') | trim }}"
+            fix: "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on"
+          - check: "Stealth mode enabled"
+            status: "{{ 'PASS' if (mac_fw_stealth.stdout | default('')) is search('enabled') else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "{{ mac_fw_stealth.stdout | default('unable to check') | trim }}"
+            fix: "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setstealthmode on"
+      tags: [firewall]
+
+    - name: "[FIREWALL] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ firewall_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [firewall]
+
+    - name: "[FIREWALL] Open ports listing"
+      debug:
+        msg: "{{ mac_open_ports.stdout_lines | default([]) }}"
+      tags: [firewall]
+
+    # =========================================================================
+    # System Integrity & Gatekeeper Checks
+    # =========================================================================
+    - name: "[SERVICES] Check SIP status"
+      shell: csrutil status 2>/dev/null
+      register: mac_sip
+      changed_when: false
+      failed_when: false
+      tags: [services]
+
+    - name: "[SERVICES] Check Gatekeeper status"
+      shell: spctl --status 2>/dev/null
+      register: mac_gatekeeper
+      changed_when: false
+      failed_when: false
+      tags: [services]
+
+    - name: "[SERVICES] Check XProtect version"
+      shell: system_profiler SPInstallHistoryDataType 2>/dev/null | grep -A2 "XProtect" | tail -2
+      register: mac_xprotect
+      changed_when: false
+      failed_when: false
+      tags: [services]
+
+    - name: "[SERVICES] Check screen saver lock"
+      shell: |
+        osascript -e 'tell application "System Events" to get properties of security preferences' 2>/dev/null | grep -o "require password to wake:true\|require password to wake:false" || echo "unable to check"
+      register: mac_screen_lock
+      changed_when: false
+      failed_when: false
+      tags: [services]
+
+    - name: "[SERVICES] Check auto-login disabled"
+      shell: defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null || echo "disabled"
+      register: mac_autologin
+      changed_when: false
+      failed_when: false
+      tags: [services]
+
+    - name: "[SERVICES] Check AirDrop status"
+      shell: defaults read com.apple.NetworkBrowser DisableAirDrop 2>/dev/null || echo "not set"
+      register: mac_airdrop
+      changed_when: false
+      failed_when: false
+      tags: [services]
+
+    - name: "[SERVICES] Check Bluetooth sharing"
+      shell: defaults read /Library/Preferences/com.apple.Bluetooth PrefKeyServicesEnabled 2>/dev/null || echo "0"
+      register: mac_bt_sharing
+      changed_when: false
+      failed_when: false
+      tags: [services]
+
+    - name: "[SERVICES] Build findings"
+      set_fact:
+        services_findings:
+          - check: "System Integrity Protection (SIP)"
+            status: "{{ 'PASS' if (mac_sip.stdout | default('')) is search('enabled') else 'FAIL' }}"
+            severity: "CRITICAL"
+            detail: "{{ mac_sip.stdout | default('unable to check') | trim }}"
+            fix: "Boot to Recovery Mode (Cmd+R), open Terminal: csrutil enable"
+          - check: "Gatekeeper enabled"
+            status: "{{ 'PASS' if (mac_gatekeeper.stdout | default('')) is search('assessments enabled') else 'FAIL' }}"
+            severity: "CRITICAL"
+            detail: "{{ mac_gatekeeper.stdout | default('unable to check') | trim }}"
+            fix: "sudo spctl --master-enable"
+          - check: "Auto-login disabled"
+            status: "{{ 'PASS' if (mac_autologin.stdout | default('')) is search('disabled') or (mac_autologin.stdout | default('')) is search('does not exist') else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "Auto-login: {{ mac_autologin.stdout | default('unknown') | trim }}"
+            fix: "sudo defaults delete /Library/Preferences/com.apple.loginwindow autoLoginUser"
+          - check: "AirDrop disabled"
+            status: "{{ 'PASS' if (mac_airdrop.stdout | default('0') | trim) == '1' else 'WARN' }}"
+            severity: "MEDIUM"
+            detail: "DisableAirDrop = {{ mac_airdrop.stdout | default('not set') | trim }}"
+            fix: "defaults write com.apple.NetworkBrowser DisableAirDrop -bool true"
+          - check: "Bluetooth sharing disabled"
+            status: "{{ 'PASS' if (mac_bt_sharing.stdout | default('0') | trim) == '0' else 'FAIL' }}"
+            severity: "MEDIUM"
+            detail: "Bluetooth sharing: {{ 'enabled' if (mac_bt_sharing.stdout | default('0') | trim) == '1' else 'disabled' }}"
+            fix: "defaults write /Library/Preferences/com.apple.Bluetooth PrefKeyServicesEnabled -bool false"
+      tags: [services]
+
+    - name: "[SERVICES] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ services_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [services]
+
+    # =========================================================================
+    # Filesystem Checks
+    # =========================================================================
+    - name: "[FILESYSTEM] Check home directory permissions"
+      shell: ls -ld /Users/*/  2>/dev/null | awk '{print $1, $3, $9}'
+      register: mac_home_perms
+      changed_when: false
+      failed_when: false
+      tags: [filesystem]
+
+    - name: "[FILESYSTEM] Check world-writable files in /etc"
+      shell: find /etc -xdev -type f -perm -0002 2>/dev/null | head -20
+      register: world_writable
+      changed_when: false
+      failed_when: false
+      tags: [filesystem]
+
+    - name: "[FILESYSTEM] Check critical file permissions"
+      stat:
+        path: "{{ item }}"
+      register: mac_file_perms
+      failed_when: false
+      loop:
+        - /etc/ssh/sshd_config
+        - /etc/sudoers
+        - /etc/passwd
+      tags: [filesystem]
+
+    - name: "[FILESYSTEM] Build findings"
+      set_fact:
+        filesystem_findings:
+          - check: "World-writable files in /etc"
+            status: "{{ 'PASS' if (world_writable.stdout | default('') | length) == 0 else 'WARN' }}"
+            severity: "HIGH"
+            detail: "{{ world_writable.stdout | default('None found') if (world_writable.stdout | default('') | length) > 0 else 'None found' }}"
+            fix: "Review and fix permissions: chmod o-w <file>"
+      tags: [filesystem]
+
+    - name: "[FILESYSTEM] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ filesystem_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [filesystem]
+
+    # =========================================================================
+    # Patch Status Checks
+    # =========================================================================
+    - name: "[PATCHES] Check macOS version"
+      shell: sw_vers -productVersion
+      register: mac_version
+      changed_when: false
+      tags: [patches]
+
+    - name: "[PATCHES] Check build number"
+      shell: sw_vers -buildVersion
+      register: mac_build
+      changed_when: false
+      tags: [patches]
+
+    - name: "[PATCHES] Check available software updates"
+      shell: softwareupdate -l 2>&1
+      register: mac_updates
+      changed_when: false
+      failed_when: false
+      tags: [patches]
+
+    - name: "[PATCHES] Check automatic updates enabled"
+      shell: defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled 2>/dev/null || echo "0"
+      register: mac_auto_update
+      changed_when: false
+      failed_when: false
+      tags: [patches]
+
+    - name: "[PATCHES] Check automatic download"
+      shell: defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload 2>/dev/null || echo "0"
+      register: mac_auto_download
+      changed_when: false
+      failed_when: false
+      tags: [patches]
+
+    - name: "[PATCHES] Check auto install critical updates"
+      shell: defaults read /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall 2>/dev/null || echo "0"
+      register: mac_critical_updates
+      changed_when: false
+      failed_when: false
+      tags: [patches]
+
+    - name: "[PATCHES] Check auto install macOS updates"
+      shell: defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates 2>/dev/null || echo "0"
+      register: mac_auto_install
+      changed_when: false
+      failed_when: false
+      tags: [patches]
+
+    - name: "[PATCHES] Build findings"
+      set_fact:
+        patches_findings:
+          - check: "macOS version"
+            status: "INFO"
+            severity: "LOW"
+            detail: "macOS {{ mac_version.stdout | default('unknown') }} ({{ mac_build.stdout | default('unknown') }})"
+            fix: "N/A"
+          - check: "Available updates"
+            status: "{{ 'PASS' if (mac_updates.stdout | default('')) is search('No new software available') else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "{{ 'No updates available' if (mac_updates.stdout | default('')) is search('No new software available') else 'Updates available' }}"
+            fix: "sudo softwareupdate -ia"
+          - check: "Automatic update check"
+            status: "{{ 'PASS' if (mac_auto_update.stdout | default('0') | trim) == '1' else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "AutomaticCheckEnabled = {{ mac_auto_update.stdout | default('not set') | trim }}"
+            fix: "sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled -bool true"
+          - check: "Automatic download"
+            status: "{{ 'PASS' if (mac_auto_download.stdout | default('0') | trim) == '1' else 'FAIL' }}"
+            severity: "MEDIUM"
+            detail: "AutomaticDownload = {{ mac_auto_download.stdout | default('not set') | trim }}"
+            fix: "sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload -bool true"
+          - check: "Auto install critical updates"
+            status: "{{ 'PASS' if (mac_critical_updates.stdout | default('0') | trim) == '1' else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "CriticalUpdateInstall = {{ mac_critical_updates.stdout | default('not set') | trim }}"
+            fix: "sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall -bool true"
+          - check: "Auto install macOS updates"
+            status: "{{ 'PASS' if (mac_auto_install.stdout | default('0') | trim) == '1' else 'FAIL' }}"
+            severity: "MEDIUM"
+            detail: "AutomaticallyInstallMacOSUpdates = {{ mac_auto_install.stdout | default('not set') | trim }}"
+            fix: "sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates -bool true"
+      tags: [patches]
+
+    - name: "[PATCHES] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ patches_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [patches]
+
+    - name: "[PATCHES] Updates detail"
+      debug:
+        msg: "{{ mac_updates.stdout_lines | default([]) }}"
+      when: not ((mac_updates.stdout | default('')) is search('No new software available'))
+      tags: [patches]
+
+    # =========================================================================
+    # Authentication & Access Control Checks
+    # =========================================================================
+    - name: "[AUTH] Check password policy"
+      shell: pwpolicy -getaccountpolicies 2>/dev/null | grep -c "policyAttributePassword" || echo "0"
+      register: mac_pw_policy
+      changed_when: false
+      failed_when: false
+      tags: [auth]
+
+    - name: "[AUTH] Check guest account disabled"
+      shell: defaults read /Library/Preferences/com.apple.loginwindow GuestEnabled 2>/dev/null || echo "1"
+      register: mac_guest
+      changed_when: false
+      failed_when: false
+      tags: [auth]
+
+    - name: "[AUTH] Check login window shows name+password"
+      shell: defaults read /Library/Preferences/com.apple.loginwindow SHOWFULLNAME 2>/dev/null || echo "0"
+      register: mac_login_name
+      changed_when: false
+      failed_when: false
+      tags: [auth]
+
+    - name: "[AUTH] Check password hints disabled"
+      shell: defaults read /Library/Preferences/com.apple.loginwindow RetriesUntilHint 2>/dev/null || echo "not set"
+      register: mac_pw_hints
+      changed_when: false
+      failed_when: false
+      tags: [auth]
+
+    - name: "[AUTH] Check sudo timeout"
+      shell: grep -i "timestamp_timeout" /etc/sudoers /etc/sudoers.d/* 2>/dev/null || echo "default (5 min)"
+      register: mac_sudo_timeout
+      changed_when: false
+      failed_when: false
+      tags: [auth]
+
+    - name: "[AUTH] Check admin users"
+      shell: "dscl . -read /Groups/admin GroupMembership 2>/dev/null | sed 's/GroupMembership: //'"
+      register: mac_admin_users
+      changed_when: false
+      failed_when: false
+      tags: [auth]
+
+    - name: "[AUTH] Build findings"
+      set_fact:
+        auth_findings:
+          - check: "Guest account disabled"
+            status: "{{ 'PASS' if (mac_guest.stdout | default('1') | trim) == '0' else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "GuestEnabled = {{ mac_guest.stdout | default('unknown') | trim }}"
+            fix: "sudo defaults write /Library/Preferences/com.apple.loginwindow GuestEnabled -bool false"
+          - check: "Login window shows name and password"
+            status: "{{ 'PASS' if (mac_login_name.stdout | default('0') | trim) == '1' else 'WARN' }}"
+            severity: "MEDIUM"
+            detail: "SHOWFULLNAME = {{ mac_login_name.stdout | default('not set') | trim }}"
+            fix: "sudo defaults write /Library/Preferences/com.apple.loginwindow SHOWFULLNAME -bool true"
+          - check: "Password hints disabled"
+            status: "{{ 'PASS' if (mac_pw_hints.stdout | default('3') | trim) == '0' or (mac_pw_hints.stdout | default('')) is search('not set') else 'WARN' }}"
+            severity: "LOW"
+            detail: "RetriesUntilHint = {{ mac_pw_hints.stdout | default('not set') | trim }}"
+            fix: "sudo defaults write /Library/Preferences/com.apple.loginwindow RetriesUntilHint -int 0"
+          - check: "Admin group members"
+            status: "INFO"
+            severity: "MEDIUM"
+            detail: "Admins: {{ mac_admin_users.stdout | default('unknown') | trim }}"
+            fix: "Review admin group membership; remove unnecessary users"
+      tags: [auth]
+
+    - name: "[AUTH] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ auth_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [auth]
+
+    # =========================================================================
+    # Audit & Logging Checks
+    # =========================================================================
+    - name: "[AUDIT] Check audit service"
+      shell: launchctl list com.apple.auditd 2>/dev/null && echo "running" || echo "not running"
+      register: mac_auditd
+      changed_when: false
+      failed_when: false
+      tags: [audit]
+
+    - name: "[AUDIT] Check install.log exists"
+      stat:
+        path: /var/log/install.log
+      register: mac_install_log
+      tags: [audit]
+
+    - name: "[AUDIT] Check unified logging"
+      shell: log show --last 1m --info 2>/dev/null | head -1 && echo "working" || echo "failed"
+      register: mac_unified_log
+      changed_when: false
+      failed_when: false
+      tags: [audit]
+
+    - name: "[AUDIT] Check httpd access log forwarding"
+      shell: ls /var/log/apache2/access_log 2>/dev/null && echo "exists" || echo "absent"
+      register: mac_httpd_log
+      changed_when: false
+      failed_when: false
+      tags: [audit]
+
+    - name: "[AUDIT] Build findings"
+      set_fact:
+        audit_findings:
+          - check: "auditd running"
+            status: "{{ 'PASS' if (mac_auditd.stdout | default('')) is search('running') else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "auditd: {{ mac_auditd.stdout | default('unknown') | trim }}"
+            fix: "sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.auditd.plist"
+          - check: "Unified logging working"
+            status: "{{ 'PASS' if (mac_unified_log.stdout | default('')) is search('working') else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "Unified logging: {{ 'operational' if (mac_unified_log.stdout | default('')) is search('working') else 'not working' }}"
+            fix: "Check log subsystem configuration"
+      tags: [audit]
+
+    - name: "[AUDIT] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ audit_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [audit]
+
+    # =========================================================================
+    # Network Security Checks
+    # =========================================================================
+    - name: "[NETWORK] Check IP forwarding"
+      shell: sysctl -n net.inet.ip.forwarding 2>/dev/null || echo "not set"
+      register: mac_ip_forward
+      changed_when: false
+      failed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Check Bonjour advertising"
+      shell: defaults read /Library/Preferences/com.apple.mDNSResponder.plist NoMulticastAdvertisements 2>/dev/null || echo "0"
+      register: mac_bonjour
+      changed_when: false
+      failed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Check wake on network"
+      shell: pmset -g | grep -i "womp" | awk '{print $2}'
+      register: mac_wol
+      changed_when: false
+      failed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Check Internet Sharing"
+      shell: defaults read /Library/Preferences/SystemConfiguration/com.apple.nat NAT 2>/dev/null | grep -c "Enabled = 1" || echo "0"
+      register: mac_internet_sharing
+      changed_when: false
+      failed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Check Wi-Fi auto-join"
+      shell: networksetup -listpreferredwirelessnetworks en0 2>/dev/null | grep -v "Preferred" | wc -l
+      register: mac_wifi_saved
+      changed_when: false
+      failed_when: false
+      tags: [network]
+
+    - name: "[NETWORK] Build findings"
+      set_fact:
+        network_findings:
+          - check: "IP forwarding disabled"
+            status: "{{ 'PASS' if (mac_ip_forward.stdout | default('0') | trim) == '0' else 'FAIL' }}"
+            severity: "MEDIUM"
+            detail: "net.inet.ip.forwarding = {{ mac_ip_forward.stdout | default('unknown') | trim }}"
+            fix: "sudo sysctl -w net.inet.ip.forwarding=0"
+          - check: "Bonjour advertising disabled"
+            status: "{{ 'PASS' if (mac_bonjour.stdout | default('0') | trim) == '1' else 'WARN' }}"
+            severity: "LOW"
+            detail: "NoMulticastAdvertisements = {{ mac_bonjour.stdout | default('not set') | trim }}"
+            fix: "sudo defaults write /Library/Preferences/com.apple.mDNSResponder.plist NoMulticastAdvertisements -bool true"
+          - check: "Internet Sharing disabled"
+            status: "{{ 'PASS' if (mac_internet_sharing.stdout | default('0') | trim) == '0' else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "Internet Sharing {{ 'enabled' if (mac_internet_sharing.stdout | default('0') | trim) != '0' else 'disabled' }}"
+            fix: "Disable via System Preferences > Sharing > Internet Sharing"
+          - check: "Saved Wi-Fi networks"
+            status: "INFO"
+            severity: "LOW"
+            detail: "{{ mac_wifi_saved.stdout | default('0') | trim }} saved networks"
+            fix: "Review and remove unnecessary saved networks"
+      tags: [network]
+
+    - name: "[NETWORK] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ network_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [network]
+
+    # =========================================================================
+    # Security Agent Checks
+    # =========================================================================
+    - name: "[AGENTS] Check Wazuh agent"
+      shell: /Library/Ossec/bin/wazuh-control status 2>/dev/null || echo "not installed"
+      register: mac_wazuh
+      changed_when: false
+      failed_when: false
+      tags: [agents]
+
+    - name: "[AGENTS] Check Tailscale"
+      shell: tailscale status --json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('BackendState','unknown'))" 2>/dev/null || echo "not installed"
+      register: mac_tailscale
+      changed_when: false
+      failed_when: false
+      tags: [agents]
+
+    - name: "[AGENTS] Check MDM enrollment"
+      shell: profiles status -type enrollment 2>/dev/null || echo "not enrolled"
+      register: mac_mdm
+      changed_when: false
+      failed_when: false
+      tags: [agents]
+
+    - name: "[AGENTS] Build findings"
+      set_fact:
+        agents_findings:
+          - check: "Wazuh agent"
+            status: "{{ 'PASS' if (mac_wazuh.stdout | default('')) is search('is running') else 'FAIL' }}"
+            severity: "HIGH"
+            detail: "{{ mac_wazuh.stdout | default('not installed') | trim }}"
+            fix: "Install Wazuh agent from manager"
+          - check: "Tailscale"
+            status: "{{ 'PASS' if (mac_tailscale.stdout | default('')) == 'Running' else 'WARN' }}"
+            severity: "MEDIUM"
+            detail: "Tailscale: {{ mac_tailscale.stdout | default('unknown') | trim }}"
+            fix: "Install Tailscale from App Store or brew"
+          - check: "MDM enrollment"
+            status: "{{ 'INFO' }}"
+            severity: "LOW"
+            detail: "{{ mac_mdm.stdout | default('not enrolled') | trim }}"
+            fix: "Enroll via MDM provider if applicable"
+      tags: [agents]
+
+    - name: "[AGENTS] Display results"
+      debug:
+        msg: "{{ item.status }} [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ agents_findings }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [agents]
+
+    # =========================================================================
+    # Aggregate all findings for report
+    # =========================================================================
+    - name: "[SUMMARY] Aggregate all findings"
+      set_fact:
+        all_findings: >-
+          {{
+            (ssh_findings | default([])) +
+            (encryption_findings | default([])) +
+            (firewall_findings | default([])) +
+            (services_findings | default([])) +
+            (filesystem_findings | default([])) +
+            (patches_findings | default([])) +
+            (auth_findings | default([])) +
+            (audit_findings | default([])) +
+            (network_findings | default([])) +
+            (agents_findings | default([]))
+          }}
+      tags: [always]
+
+    - name: "[SUMMARY] Count results"
+      set_fact:
+        pass_count: "{{ all_findings | selectattr('status', 'equalto', 'PASS') | list | length }}"
+        fail_count: "{{ all_findings | selectattr('status', 'equalto', 'FAIL') | list | length }}"
+        warn_count: "{{ all_findings | selectattr('status', 'equalto', 'WARN') | list | length }}"
+        critical_count: "{{ all_findings | selectattr('severity', 'equalto', 'CRITICAL') | selectattr('status', 'equalto', 'FAIL') | list | length }}"
+        high_count: "{{ all_findings | selectattr('severity', 'equalto', 'HIGH') | selectattr('status', 'equalto', 'FAIL') | list | length }}"
+        medium_count: "{{ all_findings | selectattr('severity', 'equalto', 'MEDIUM') | selectattr('status', 'equalto', 'FAIL') | list | length }}"
+        low_count: "{{ all_findings | selectattr('severity', 'equalto', 'LOW') | selectattr('status', 'equalto', 'FAIL') | list | length }}"
+      tags: [always]
+
+    - name: "[SUMMARY] Display summary"
+      debug:
+        msg:
+          - "========================================="
+          - "  macOS SECURITY AUDIT: {{ inventory_hostname }}"
+          - "========================================="
+          - "  PASS: {{ pass_count }} | FAIL: {{ fail_count }} | WARN: {{ warn_count }}"
+          - "  CRITICAL fails: {{ critical_count }}"
+          - "  HIGH fails:     {{ high_count }}"
+          - "  MEDIUM fails:   {{ medium_count }}"
+          - "  LOW fails:      {{ low_count }}"
+          - "========================================="
+      tags: [always]
+
+    - name: "[SUMMARY] List failed checks"
+      debug:
+        msg: "FAIL [{{ item.severity }}] {{ item.check }} — {{ item.detail }}"
+      loop: "{{ all_findings | selectattr('status', 'equalto', 'FAIL') | list }}"
+      loop_control:
+        label: "{{ item.check }}"
+      tags: [always]
+
+# =============================================================================
+# Report Generation (runs on localhost)
+# =============================================================================
+- name: Generate macOS Security Audit Report
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  tags: [always]
+  vars:
+    report_date: "{{ ansible_date_time.date }}"
+    report_dir: "{{ lookup('env', 'HOME') }}/HiFi Solutions/hifi-security-audit/reports"
+    report_file: "{{ report_dir }}/security-audit-macos-{{ ansible_date_time.date }}.md"
+
+  tasks:
+    - name: "[REPORT] Create reports directory"
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: "[REPORT] Generate markdown report"
+      template:
+        src: templates/security-report-macos.md.j2
+        dest: "{{ report_file }}"
+        mode: "0644"
+
+    - name: "[REPORT] Report location"
+      debug:
+        msg: "macOS security audit report written to: {{ report_file }}"

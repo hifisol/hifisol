@@ -1,0 +1,15 @@
+[Unit]
+Description=Velociraptor REST API Proxy for Shuffle SOAR
+After=network.target velociraptor.service
+Wants=velociraptor.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/velo-api-proxy
+ExecStart=/usr/bin/python3 /opt/velo-api-proxy/proxy.py
+Restart=on-failure
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -18,11 +18,13 @@ A multi-tool SOC stack that mirrors enterprise security operations:
 - **Infrastructure Automation** — 20+ Ansible playbooks for agent deployment, CIS hardening, and AD lab orchestration
 - **Network Security** — VLAN segmentation, UDM Pro IDS/IPS, Tailscale overlay network
 
-## Repository
+## Repositories
 
 | Repository | Description |
 |-----------|-------------|
 | [homelab-soc-infrastructure](https://github.com/hifisol/homelab-soc-infrastructure) | Full SOC stack — detection rules, Ansible automation, Docker services, persistence scripts, and architecture docs |
+| [infrastructure-automation](infrastructure-automation/) | Ansible playbooks for agent deployment, CIS-aligned security audits, multi-platform health checks, and DeepBlueCLI integration |
+| [adversarial-emulation](https://github.com/hifisol/adversarial-emulation) | Offensive security tooling — WiFi pentesting, hardware implants, Metasploit methodology, physical pentest guides |
 
 ## Tools & Skills
 
